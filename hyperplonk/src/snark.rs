@@ -11,10 +11,12 @@ use crate::{
     utils::{build_f, prover_sanity_check, PcsAccumulator},
     HyperPlonkSNARK,
 };
+
 use arithmetic::{build_eq_x_r_vec, VirtualPolynomial};
 use ark_ec::pairing::Pairing;
 use ark_poly::DenseMultilinearExtension;
-use ark_std::{end_timer, start_timer, Zero};
+use ark_std::time::Instant;
+use ark_std::Zero;
 use rayon::iter::IntoParallelRefIterator;
 #[cfg(feature = "parallel")]
 use rayon::iter::ParallelIterator;
@@ -28,7 +30,6 @@ use subroutines::{
     BatchProof, IOPProof,
 };
 use transcript::IOPTranscript;
-use ark_std::time::Instant;
 
 impl<E, PCS> HyperPlonkSNARK<E, PCS> for PolyIOP<E::ScalarField>
 where
@@ -53,7 +54,7 @@ where
     fn preprocess(
         index: &Self::Index,
         pcs_srs: &PCS::SRS,
-    ) -> Result<(Self::ProvingKey, Self::VerifyingKey,Duration), HyperPlonkErrors> {
+    ) -> Result<(Self::ProvingKey, Self::VerifyingKey, Duration), HyperPlonkErrors> {
         let start = Instant::now();
         let num_vars = index.num_variables();
         let supported_ml_degree = num_vars;
@@ -112,15 +113,15 @@ where
         circuits: Vec<MockCircuit<E::ScalarField>>,
     ) -> Result<
         (
-            Vec<VirtualPolynomial<E::ScalarField>>, 
-            Vec<VirtualPolynomial<E::ScalarField>>, 
-            Vec<Vec<PCS::Commitment>>, 
-            Vec<Vec<PCS::Commitment>>, 
+            Vec<VirtualPolynomial<E::ScalarField>>,
+            Vec<VirtualPolynomial<E::ScalarField>>,
+            Vec<Vec<PCS::Commitment>>,
+            Vec<Vec<PCS::Commitment>>,
             Duration,
         ),
         HyperPlonkErrors,
     > {
-        let mul_prove= Instant::now();
+        let mul_prove = Instant::now();
         let mut transcript = IOPTranscript::<E::ScalarField>::new(b"mul_prove");
         let mut f_hats = Vec::new();
         let mut perm_f_hats = Vec::new();
@@ -129,7 +130,7 @@ where
         let mut duration_wit = Duration::from_secs(0);
         let mut duration_f_hat = Duration::from_secs(0);
         let mut duration_perm_hat = Duration::from_secs(0);
-        for (i, circuit) in circuits.iter().enumerate() {
+        for circuit in circuits.iter() {
             let pub_input = &circuit.public_inputs;
             let witness = circuit.witnesses.clone();
             prover_sanity_check(&pk.params, &pub_input, &witness)?;
@@ -139,7 +140,7 @@ where
                 .iter()
                 .map(|w| Arc::new(DenseMultilinearExtension::from(w)))
                 .collect();
-            let start= Instant::now();
+            let start = Instant::now();
             let witness_commits = witness_polys
                 .par_iter()
                 .map(|x| PCS::commit(&pk.pcs_param, x).unwrap())
@@ -148,7 +149,6 @@ where
             for w_com in witness_commits.iter() {
                 transcript.append_serializable_element(b"w", w_com)?;
             }
-            
 
             let fx = build_f(
                 &pk.params.gate_func,
@@ -157,7 +157,7 @@ where
                 &witness_polys,
             )?;
             let f_hat = <Self as ZeroCheck<E::ScalarField>>::mul_prove(&fx, &mut transcript)?;
-            let f_hat_start= Instant::now();
+            let f_hat_start = Instant::now();
             let f_hat_comms: Vec<PCS::Commitment> = f_hat
                 .flattened_ml_extensions
                 .iter()
@@ -180,13 +180,12 @@ where
                 )
                 .map_err(|e| HyperPlonkErrors::from(e))?;
 
-            
             let prod_comm = PCS::commit(&pk.pcs_param, &prod_poly)?;
             let frac_comm = PCS::commit(&pk.pcs_param, &frac_poly)?;
             transcript.append_serializable_element(b"prod_poly", &prod_comm)?;
             transcript.append_serializable_element(b"frac_poly", &frac_comm)?;
-            
-            let perm_com_start= Instant::now();
+
+            let perm_com_start = Instant::now();
             let perm_f_hat_comms: Vec<PCS::Commitment> = perm_f_hat
                 .flattened_ml_extensions
                 .iter()
@@ -199,9 +198,19 @@ where
             perm_f_commitments.push(perm_f_hat_comms);
             duration_perm_hat += perm_com_start.elapsed();
         }
-        let mul_prove_duration = mul_prove.elapsed() - duration_f_hat-duration_perm_hat -duration_wit;
-        println!("----------------- mul_prove Duration ----------------------{:?}",mul_prove_duration);
-        Ok((f_hats, perm_f_hats, f_commitments, perm_f_commitments, duration_wit))
+        let mul_prove_duration =
+            mul_prove.elapsed() - duration_f_hat - duration_perm_hat - duration_wit;
+        println!(
+            "----------------- mul_prove Duration ----------------------{:?}",
+            mul_prove_duration
+        );
+        Ok((
+            f_hats,
+            perm_f_hats,
+            f_commitments,
+            perm_f_commitments,
+            duration_wit,
+        ))
     }
 
     fn prove(
@@ -258,7 +267,12 @@ where
         }
 
         let pcs_param = &pk.pcs_param;
+        let start_prove = Instant::now();
         let batch_opening_proof = pcs_acc.multi_open(pcs_param, transcript)?;
+         println!(
+            "--------------Prove Duration----------------{:?}",
+            start_prove.elapsed()
+        );
         // println!("proof{:?}",batch_opening_proof);
         let evaluations: Vec<E::ScalarField> = batch_opening_proof
             .f_i_eval_at_point_i
@@ -303,7 +317,7 @@ where
         vk: &Self::VerifyingKey,
         transcript: &mut IOPTranscript<E::ScalarField>,
     ) -> Result<bool, HyperPlonkErrors> {
-        let start_verify= Instant::now();
+        let start_verify = Instant::now();
         let (f_hats, f_folded_evals) = &polys[0];
         let (perm_f_hats, perm_folded_evals) = &polys[1];
 
@@ -414,37 +428,51 @@ where
         if !f_evals_match || !perm_evals_match {
             return Ok(false);
         }
-        println!("--------------Verify Duration----------------{:?}", start_verify.elapsed());
+        println!(
+            "--------------Verify Duration----------------{:?}",
+            start_verify.elapsed()
+        );
         Ok(true)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
 
     use super::*;
     use crate::custom_gate::CustomizedGates;
     use ark_bls12_381::Bls12_381;
+    use ark_serialize::CanonicalSerialize;
     use ark_std::rand::rngs::StdRng;
     use ark_std::test_rng;
+    use ark_std::time::Instant;
+    use subroutines::pcs::Samaritan::SamaritanPCS;
     use subroutines::MercuryPCS;
     use subroutines::SumCheck;
-    use subroutines::pcs::Samaritan::SamaritanPCS;
-    use ark_std::time::Instant;
+    use subroutines::{
+        pcs::prelude::PolynomialCommitmentScheme, poly_iop::PolyIOP, BatchProof, IOPProof,
+    };
 
     #[test]
     fn test_hyperplonk_e2e() -> Result<(), HyperPlonkErrors> {
         let mock_gate = CustomizedGates::vanilla_plonk_gate();
-        let nv = 18;
-        let log_partition = 1;
+        // let mock_gate = CustomizedGates {
+        //     gates: vec![(1, Some(0), vec![0, 0, 0, 0, 0]), (-1, None, vec![1])],
+        // };
+        let nv = 20;
+        let log_partition = 3;
         let num_constraints = 1 << nv;
         let num_partition = 1 << log_partition;
-        println!("---------begin test mecury---------");
-        test_hyperplonk_helper::<Bls12_381>(mock_gate.clone(), num_constraints, num_partition, nv - log_partition);
-        println!("---------finish test mecury---------");
+        // println!("---------begin test mecury---------");
+        // let _= test_hyperplonk_helper::<Bls12_381>(mock_gate.clone(), num_constraints, num_partition, nv - log_partition);
+        // println!("---------finish test mecury---------");
         println!("---------begin test sama---------");
-        test_hyperplonk_Sama::<Bls12_381>(mock_gate, num_constraints, num_partition, nv - log_partition)
+        test_hyperplonk_Sama::<Bls12_381>(
+            mock_gate,
+            num_constraints,
+            num_partition,
+            nv - log_partition,
+        )
     }
 
     fn test_hyperplonk_helper<E: Pairing>(
@@ -454,7 +482,7 @@ mod tests {
         support_size: usize,
     ) -> Result<(), HyperPlonkErrors> {
         let mut rng = test_rng();
-        let pcs_srs =  MercuryPCS::<E>::gen_srs_for_testing(&mut rng, support_size)?;
+        let pcs_srs = MercuryPCS::<E>::gen_srs_for_testing(&mut rng, support_size)?;
         // let num_witness = 5;
         // let degree = 4;
 
@@ -467,20 +495,22 @@ mod tests {
         let mut transcript =
             <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::init_transcript();
 
-       
-        let (pk, vk,duration_sel) = <PolyIOP<E::ScalarField> as HyperPlonkSNARK<E,  MercuryPCS<E>>>::preprocess(
-            &partition_circuits[0].index,
-            &pcs_srs,
-        )?;
-     
-        let prove= Instant::now();
-        let (f_hats, perm_f_hats, f_hat_commitments, perm_f_commitments,duration_wit) =
-            <PolyIOP<E::ScalarField> as HyperPlonkSNARK<E,  MercuryPCS<E>>>::mul_prove(
+        let (pk, vk, duration_sel) = <PolyIOP<E::ScalarField> as HyperPlonkSNARK<
+            E,
+            MercuryPCS<E>,
+        >>::preprocess(&partition_circuits[0].index, &pcs_srs)?;
+
+        let prove = Instant::now();
+        let (f_hats, perm_f_hats, f_hat_commitments, perm_f_commitments, duration_wit) =
+            <PolyIOP<E::ScalarField> as HyperPlonkSNARK<E, MercuryPCS<E>>>::mul_prove(
                 &pk,
                 partition_circuits,
             )?;
         let duration_com = duration_sel + duration_wit;
-        println!("-----------------Commit Mercury Duration {:?}",duration_com);
+        println!(
+            "-----------------Commit Mercury Duration {:?}",
+            duration_com
+        );
         let sums = vec![E::ScalarField::zero(); f_hats.len()];
 
         let start = Instant::now();
@@ -491,7 +521,7 @@ mod tests {
                 &mut transcript,
             )?;
         let duration_fold1 = start.elapsed();
-        
+
         let start = Instant::now();
         let mut transcript =
             <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::init_transcript();
@@ -503,7 +533,7 @@ mod tests {
         )?;
         let duration_verify1 = start.elapsed();
 
-        let start= Instant::now();
+        let start = Instant::now();
         let mut transcript =
             <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::init_transcript();
         let proof = <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::prove(
@@ -512,7 +542,7 @@ mod tests {
         )?;
         let duration_check1 = start.elapsed();
 
-        let start= Instant::now();
+        let start = Instant::now();
         let mut transcript =
             <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::init_transcript();
         let subclaim = <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::verify(
@@ -531,7 +561,7 @@ mod tests {
             <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::init_transcript();
         let sums = vec![E::ScalarField::zero(); perm_f_hats.len()];
 
-        let start= Instant::now();
+        let start = Instant::now();
         let (perm_q_proof, perm_q_sum, perm_q_aux_info, perm_fold_poly, perm_fold_sum) =
             <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::sum_fold(
                 perm_f_hats.clone(),
@@ -540,7 +570,7 @@ mod tests {
             )?;
         let duration_fold2 = start.elapsed();
         // 验证 perm_f_hats 的求和检查子声明
-        let start= Instant::now();
+        let start = Instant::now();
         let mut transcript =
             <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::init_transcript();
         let perm_subclaim = <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::verify(
@@ -554,7 +584,7 @@ mod tests {
         let mut transcript =
             <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::init_transcript();
 
-        let start= Instant::now();
+        let start = Instant::now();
         let perm_proof = <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::prove(
             &perm_fold_poly.deep_copy(),
             &mut transcript,
@@ -563,28 +593,38 @@ mod tests {
         let mut transcript =
             <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::init_transcript();
 
-        let start= Instant::now();
+        let start = Instant::now();
         let perm_subclaim = <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::verify(
             fold_sum,
             &perm_proof,
             &perm_fold_poly.aux_info,
             &mut transcript,
         )?;
-      
+
         let duration_verify4 = start.elapsed();
 
         let sumcheck_fold_duration = duration_fold1 + duration_fold2;
-        let sumcheck_prove_duration = duration_check1+duration_check2;
-        let sumcheck_verify_duration = duration_verify1+duration_verify2+duration_verify3+duration_verify4;
-        println!("----------SumFold Duration------------{:?}",sumcheck_fold_duration);
-        println!("----------SumCheck Prove Duration----------{:?}",sumcheck_prove_duration);
-        println!("----------SumCheck Verify Duration---------{:?}",sumcheck_verify_duration);
+        let sumcheck_prove_duration = duration_check1 + duration_check2;
+        let sumcheck_verify_duration =
+            duration_verify1 + duration_verify2 + duration_verify3 + duration_verify4;
+        println!(
+            "----------SumFold Duration------------{:?}",
+            sumcheck_fold_duration
+        );
+        println!(
+            "----------SumCheck Prove Duration----------{:?}",
+            sumcheck_prove_duration
+        );
+        println!(
+            "----------SumCheck Verify Duration---------{:?}",
+            sumcheck_verify_duration
+        );
 
         let mut transcript =
             <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::init_transcript();
-        
+
         let (f_folded_evals, perm_folded_evals, batch_opening_proof) =
-            <PolyIOP<E::ScalarField> as HyperPlonkSNARK<E,  MercuryPCS<E>>>::prove(
+            <PolyIOP<E::ScalarField> as HyperPlonkSNARK<E, MercuryPCS<E>>>::prove(
                 f_hats.clone(),
                 perm_f_hats.clone(),
                 f_hat_commitments.clone(),
@@ -602,9 +642,8 @@ mod tests {
 
         let mut transcript =
             <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::init_transcript();
-        
-        
-        let is_valid = <PolyIOP<E::ScalarField> as HyperPlonkSNARK<E,  MercuryPCS<E>>>::verify(
+
+        let is_valid = <PolyIOP<E::ScalarField> as HyperPlonkSNARK<E, MercuryPCS<E>>>::verify(
             polys,
             commitments,
             q_proofs,
@@ -630,7 +669,7 @@ mod tests {
         support_size: usize,
     ) -> Result<(), HyperPlonkErrors> {
         let mut rng = test_rng();
-        let pcs_srs =  SamaritanPCS::<E>::gen_srs_for_testing(&mut rng, support_size)?;
+        let pcs_srs = SamaritanPCS::<E>::gen_srs_for_testing(&mut rng, support_size)?;
         // let num_witness = 5;
         // let degree = 4;
 
@@ -643,20 +682,22 @@ mod tests {
         let mut transcript =
             <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::init_transcript();
 
-       
-        let (pk, vk,duration_sel) = <PolyIOP<E::ScalarField> as HyperPlonkSNARK<E,  SamaritanPCS<E>>>::preprocess(
-            &partition_circuits[0].index,
-            &pcs_srs,
-        )?;
-     
-        let prove= Instant::now();
-        let (f_hats, perm_f_hats, f_hat_commitments, perm_f_commitments,duration_wit) =
-            <PolyIOP<E::ScalarField> as HyperPlonkSNARK<E,  SamaritanPCS<E>>>::mul_prove(
+        let (pk, vk, duration_sel) = <PolyIOP<E::ScalarField> as HyperPlonkSNARK<
+            E,
+            SamaritanPCS<E>,
+        >>::preprocess(&partition_circuits[0].index, &pcs_srs)?;
+
+        let prove = Instant::now();
+        let (f_hats, perm_f_hats, f_hat_commitments, perm_f_commitments, duration_wit) =
+            <PolyIOP<E::ScalarField> as HyperPlonkSNARK<E, SamaritanPCS<E>>>::mul_prove(
                 &pk,
                 partition_circuits,
             )?;
         let duration_com = duration_sel + duration_wit;
-        println!("-----------------Commit Mercury Duration {:?}",duration_com);
+        println!(
+            "-----------------Commit Mercury Duration {:?}",
+            duration_com
+        );
         let sums = vec![E::ScalarField::zero(); f_hats.len()];
 
         let start = Instant::now();
@@ -667,7 +708,7 @@ mod tests {
                 &mut transcript,
             )?;
         let duration_fold1 = start.elapsed();
-        
+
         let start = Instant::now();
         let mut transcript =
             <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::init_transcript();
@@ -679,7 +720,7 @@ mod tests {
         )?;
         let duration_verify1 = start.elapsed();
 
-        let start= Instant::now();
+        let start = Instant::now();
         let mut transcript =
             <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::init_transcript();
         let proof = <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::prove(
@@ -688,7 +729,7 @@ mod tests {
         )?;
         let duration_check1 = start.elapsed();
 
-        let start= Instant::now();
+        let start = Instant::now();
         let mut transcript =
             <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::init_transcript();
         let subclaim = <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::verify(
@@ -707,7 +748,7 @@ mod tests {
             <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::init_transcript();
         let sums = vec![E::ScalarField::zero(); perm_f_hats.len()];
 
-        let start= Instant::now();
+        let start = Instant::now();
         let (perm_q_proof, perm_q_sum, perm_q_aux_info, perm_fold_poly, perm_fold_sum) =
             <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::sum_fold(
                 perm_f_hats.clone(),
@@ -716,7 +757,7 @@ mod tests {
             )?;
         let duration_fold2 = start.elapsed();
         // 验证 perm_f_hats 的求和检查子声明
-        let start= Instant::now();
+        let start = Instant::now();
         let mut transcript =
             <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::init_transcript();
         let perm_subclaim = <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::verify(
@@ -730,7 +771,7 @@ mod tests {
         let mut transcript =
             <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::init_transcript();
 
-        let start= Instant::now();
+        let start = Instant::now();
         let perm_proof = <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::prove(
             &perm_fold_poly.deep_copy(),
             &mut transcript,
@@ -739,28 +780,38 @@ mod tests {
         let mut transcript =
             <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::init_transcript();
 
-        let start= Instant::now();
+        let start = Instant::now();
         let perm_subclaim = <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::verify(
             fold_sum,
             &perm_proof,
             &perm_fold_poly.aux_info,
             &mut transcript,
         )?;
-      
+
         let duration_verify4 = start.elapsed();
 
         let sumcheck_fold_duration = duration_fold1 + duration_fold2;
-        let sumcheck_prove_duration = duration_check1+duration_check2;
-        let sumcheck_verify_duration = duration_verify1+duration_verify2+duration_verify3+duration_verify4;
-        println!("----------SumFold Duration------------{:?}",sumcheck_fold_duration);
-        println!("----------SumCheck Prove Duration----------{:?}",sumcheck_prove_duration);
-        println!("----------SumCheck Verify Duration---------{:?}",sumcheck_verify_duration);
+        let sumcheck_prove_duration = duration_check1 + duration_check2;
+        let sumcheck_verify_duration =
+            duration_verify1 + duration_verify2 + duration_verify3 + duration_verify4;
+        println!(
+            "----------SumFold Duration------------{:?}",
+            sumcheck_fold_duration
+        );
+        println!(
+            "----------SumCheck Prove Duration----------{:?}",
+            sumcheck_prove_duration
+        );
+        println!(
+            "----------SumCheck Verify Duration---------{:?}",
+            sumcheck_verify_duration
+        );
 
         let mut transcript =
             <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::init_transcript();
-        
+
         let (f_folded_evals, perm_folded_evals, batch_opening_proof) =
-            <PolyIOP<E::ScalarField> as HyperPlonkSNARK<E,  SamaritanPCS<E>>>::prove(
+            <PolyIOP<E::ScalarField> as HyperPlonkSNARK<E, SamaritanPCS<E>>>::prove(
                 f_hats.clone(),
                 perm_f_hats.clone(),
                 f_hat_commitments.clone(),
@@ -778,9 +829,10 @@ mod tests {
 
         let mut transcript =
             <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::init_transcript();
-        
-        
-        let is_valid = <PolyIOP<E::ScalarField> as HyperPlonkSNARK<E,  SamaritanPCS<E>>>::verify(
+
+        // cal_memory_sama(&q_proofs, &batch_opening_proof);
+
+        let is_valid = <PolyIOP<E::ScalarField> as HyperPlonkSNARK<E, SamaritanPCS<E>>>::verify(
             polys,
             commitments,
             q_proofs,
@@ -788,7 +840,32 @@ mod tests {
             &vk,
             &mut transcript,
         )?;
-        //assert!(is_valid, "HyperPlonk verification failed");
+        assert!(is_valid, "HyperPlonk verification failed");
+
         Ok(())
     }
+
+    // fn cal_memory_sama<E: Pairing>(
+    //     q_proofs: &Vec<IOPProof<E::ScalarField>>,
+    //     batch_opening_proof: &BatchProof<E, SamaritanPCS<E>>,
+    // ) {
+    //     let q_proofs_size: usize = q_proofs
+    //         .iter()
+    //         .map(|proof| {
+    //             let point_size = proof.point.uncompressed_size();
+    //             let proofs_size: usize = proof.proofs.iter().map(|p| p.uncompressed_size()).sum();
+    //             point_size + proofs_size
+    //         })
+    //         .sum();
+    //     println!("q_proof_size: {} bytes",q_proofs_size);
+    //     let batch_opening_proof_size = batch_opening_proof.f_i_eval_at_point_i.uncompressed_size()
+    //         + batch_opening_proof.sum_check_proof.point.uncompressed_size()
+    //         + batch_opening_proof.sum_check_proof.proofs.uncompressed_size()
+    //         + batch_opening_proof.g_prime_proof.uncompressed_size();
+    //     let samaritanpcs_size = batch_opening_proof.g_prime_proof.uncompressed_size();
+
+    //     let total_proof_size = q_proofs_size + batch_opening_proof_size;
+    //     println!("batch_opening_proof_size: {} bytes",samaritanpcs_size);
+    //     println!("Proof size: {} bytes", total_proof_size);
+    // }
 }

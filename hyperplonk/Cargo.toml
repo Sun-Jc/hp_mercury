@@ -17,6 +17,7 @@ rayon = { version = "1.5.2", default-features = false, optional = true }
 subroutines = { path = "../subroutines" }
 transcript = { path = "../transcript" }
 util = { path = "../util" }
+datasize = "0.2.15"
 
 [dev-dependencies]
 ark-bls12-381 = { version = "0.4.0", default-features = false, features = [ "curve" ] }

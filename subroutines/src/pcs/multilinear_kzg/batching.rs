@@ -33,11 +33,11 @@ where
     PCS: PolynomialCommitmentScheme<E>,
 {
     /// A sum check proof proving tilde g's sum
-    pub(crate) sum_check_proof: IOPProof<E::ScalarField>,
+    pub sum_check_proof: IOPProof<E::ScalarField>,
     /// f_i(point_i)
     pub f_i_eval_at_point_i: Vec<E::ScalarField>,
     /// proof for g'(a_2)
-    pub(crate) g_prime_proof: PCS::Proof,
+    pub g_prime_proof: PCS::Proof,
 }
 
 /// Steps:

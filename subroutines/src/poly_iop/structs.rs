@@ -24,7 +24,7 @@ pub struct IOPProof<F: PrimeField> {
 /// is a list of evaluations.
 #[derive(Clone, Debug, Default, PartialEq, Eq, CanonicalSerialize)]
 pub struct IOPProverMessage<F: PrimeField> {
-    pub(crate) evaluations: Vec<F>,
+    pub evaluations: Vec<F>,
 }
 
 /// Prover State of a PolyIOP.

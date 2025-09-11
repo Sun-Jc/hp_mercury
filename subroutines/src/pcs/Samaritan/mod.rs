@@ -39,9 +39,9 @@ use transcript::IOPTranscript;
 
 #[derive(CanonicalSerialize, CanonicalDeserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SamaritanProof<E: Pairing> {
-    commitments: Vec<Commitment<E>>,
-    evaluations: Vec<E::ScalarField>,
-    batch_proof: Option<Vec<u8>>,
+    pub commitments: Vec<Commitment<E>>,
+    pub evaluations: Vec<E::ScalarField>,
+    pub batch_proof: Option<Vec<u8>>,
 }
 
 #[derive(CanonicalSerialize, CanonicalDeserialize, Clone, Debug, PartialEq, Eq)]
@@ -70,7 +70,7 @@ where
         let start = Instant::now();
         let srs = Self::SRS::gen_srs_for_testing(rng, log_size)?;
         let duration = start.elapsed();
-        println!("-----------------Setup Samaritan Duration{:?}",duration);
+        println!("-----------------Setup Samaritan Duration {:?}",duration);
         Ok(srs)
     }
 
