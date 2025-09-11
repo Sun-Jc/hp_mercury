@@ -230,7 +230,7 @@ where
         ),
         HyperPlonkErrors,
     > {
-        let start = start_timer!(||"prove");
+        // let start = start_timer!(||"prove");
         let f_num_vars = f_hats[0].aux_info.num_variables;
         let f_t = f_hats[0].flattened_ml_extensions.len();
         let f_m = f_hats.len();
@@ -303,7 +303,7 @@ where
                 eval_idx += 1;
             }
         }
-        end_timer!(start);
+        // end_timer!(start);
         Ok((f_folded_evals, perm_folded_evals, batch_opening_proof))
     }
 
