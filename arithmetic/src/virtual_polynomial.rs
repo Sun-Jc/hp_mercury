@@ -359,6 +359,105 @@ impl<F: PrimeField> VirtualPolynomial<F> {
         }
         println!()
     }
+
+    /// Split this VirtualPolynomial into 2^n sub-polynomials by fixing the last n variables
+    /// of each MLE to all binary assignments.
+    ///
+    /// For a VirtualPolynomial with m variables, this produces 2^n VirtualPolynomials:
+    /// - split[0]: all MLEs evaluated at f(x_1, ..., x_{m-n}, 0, 0, ..., 0)
+    /// - split[1]: all MLEs evaluated at f(x_1, ..., x_{m-n}, 1, 0, ..., 0)
+    /// - split[2]: all MLEs evaluated at f(x_1, ..., x_{m-n}, 0, 1, ..., 0)
+    /// - ...
+    /// - split[2^n - 1]: all MLEs evaluated at f(x_1, ..., x_{m-n}, 1, 1, ..., 1)
+    ///
+    /// # Memory Layout Assumption
+    /// This function relies on the little-endian bit indexing used by `DenseMultilinearExtension`.
+    /// The evaluation at index `i` corresponds to the point where binary digits of `i` give the
+    /// variable assignments in order (x_1, x_2, ..., x_m). Thus, fixing the last n variables to
+    /// assignment `j` corresponds to taking the j-th contiguous chunk of size 2^(m-n) from each MLE.
+    ///
+    /// Automatically selects parallel or sequential execution based on data size.
+    ///
+    /// # Arguments
+    /// * `n` - Number of last variables to fix (number of bits)
+    ///
+    /// # Returns
+    /// A vector of 2^n VirtualPolynomials, each with (m-n) variables
+    ///
+    /// # Panics
+    /// Panics if n > num_variables
+    pub fn split_by_last_variables(&self, n: usize) -> Vec<Self> {
+        use crate::split_by_last_variables;
+
+        let m = self.aux_info.num_variables;
+        assert!(n <= m, "n ({}) cannot exceed num_variables ({})", n, m);
+
+        if n == 0 {
+            return vec![self.clone()];
+        }
+
+        let num_splits = 1 << n;
+        let new_num_vars = m - n;
+
+        // Threshold for parallel MLE iteration (based on number of MLEs and their size)
+        const PARALLEL_MLE_THRESHOLD: usize = 4;
+
+        // Split each MLE into 2^n chunks
+        // Use parallel iteration over MLEs if there are enough of them
+        let split_mles: Vec<Vec<Arc<DenseMultilinearExtension<F>>>> =
+            if self.flattened_ml_extensions.len() >= PARALLEL_MLE_THRESHOLD {
+                self.flattened_ml_extensions
+                    .par_iter()
+                    .map(|mle| {
+                        split_by_last_variables(mle, n)
+                            .into_iter()
+                            .map(Arc::new)
+                            .collect()
+                    })
+                    .collect()
+            } else {
+                self.flattened_ml_extensions
+                    .iter()
+                    .map(|mle| {
+                        split_by_last_variables(mle, n)
+                            .into_iter()
+                            .map(Arc::new)
+                            .collect()
+                    })
+                    .collect()
+            };
+
+        // Build 2^n VirtualPolynomials
+        // Note: Sequential iteration here because VirtualPolynomial contains
+        // raw pointers in its HashMap which are not Send-safe.
+        (0..num_splits)
+            .map(|split_idx| {
+                // Collect the split_idx-th chunk of each MLE
+                let new_mles: Vec<Arc<DenseMultilinearExtension<F>>> = split_mles
+                    .iter()
+                    .map(|mle_splits| mle_splits[split_idx].clone())
+                    .collect();
+
+                // Build lookup table for new Arc pointers
+                let mut lookup_table = HashMap::new();
+                for (idx, mle) in new_mles.iter().enumerate() {
+                    let ptr: *const DenseMultilinearExtension<F> = Arc::as_ptr(mle);
+                    lookup_table.insert(ptr, idx);
+                }
+
+                VirtualPolynomial {
+                    aux_info: VPAuxInfo {
+                        max_degree: self.aux_info.max_degree,
+                        num_variables: new_num_vars,
+                        phantom: PhantomData,
+                    },
+                    products: self.products.clone(),
+                    flattened_ml_extensions: new_mles,
+                    raw_pointers_lookup_table: lookup_table,
+                }
+            })
+            .collect()
+    }
 }
 
 /// Evaluate eq polynomial.
@@ -575,5 +674,100 @@ mod test {
         let mle = DenseMultilinearExtension::from_evaluations_vec(num_var, eval);
 
         Arc::new(mle)
+    }
+
+    /// Test split_by_last_variables produces correct evaluations for VirtualPolynomial
+    #[test]
+    fn test_virtual_polynomial_split_by_last_variables() -> Result<(), ArithErrors> {
+        let mut rng = test_rng();
+
+        for m in 4..7 {
+            for n in 0..=3 {
+                for num_products in 1..3 {
+                    let (vp, _sum) =
+                        VirtualPolynomial::<Fr>::rand(m, (1, 3), num_products, &mut rng)?;
+
+                    let splits = vp.split_by_last_variables(n);
+
+                    assert_eq!(splits.len(), 1 << n);
+                    for split in &splits {
+                        assert_eq!(split.aux_info.num_variables, m - n);
+                        assert_eq!(split.aux_info.max_degree, vp.aux_info.max_degree);
+                    }
+
+                    // Verify evaluation consistency
+                    let point: Vec<Fr> = (0..(m - n)).map(|_| Fr::rand(&mut rng)).collect();
+
+                    for split_idx in 0..(1 << n) {
+                        // Build full point by appending binary assignment for split_idx
+                        let mut full_point = point.clone();
+                        for bit in 0..n {
+                            let bit_val = ((split_idx >> bit) & 1) as u64;
+                            full_point.push(Fr::from(bit_val));
+                        }
+
+                        let expected = vp.evaluate(&full_point)?;
+                        let actual = splits[split_idx].evaluate(&point)?;
+
+                        assert_eq!(
+                            expected, actual,
+                            "Mismatch at m={}, n={}, split_idx={}",
+                            m, n, split_idx
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Test edge case: n = 0 returns a clone
+    #[test]
+    fn test_virtual_polynomial_split_n_zero() -> Result<(), ArithErrors> {
+        let mut rng = test_rng();
+        let (vp, _sum) = VirtualPolynomial::<Fr>::rand(5, (2, 3), 2, &mut rng)?;
+
+        let splits = vp.split_by_last_variables(0);
+
+        assert_eq!(splits.len(), 1);
+        assert_eq!(splits[0].aux_info.num_variables, 5);
+
+        // Verify same evaluation at random point
+        let point: Vec<Fr> = (0..5).map(|_| Fr::rand(&mut rng)).collect();
+        assert_eq!(vp.evaluate(&point)?, splits[0].evaluate(&point)?);
+
+        Ok(())
+    }
+
+    /// Test edge case: n = num_variables returns 2^m constant polynomials
+    #[test]
+    fn test_virtual_polynomial_split_n_equals_num_vars() -> Result<(), ArithErrors> {
+        let mut rng = test_rng();
+        let nv = 4;
+        let (vp, _sum) = VirtualPolynomial::<Fr>::rand(nv, (1, 2), 2, &mut rng)?;
+
+        let splits = vp.split_by_last_variables(nv);
+
+        assert_eq!(splits.len(), 1 << nv);
+        for split in &splits {
+            assert_eq!(split.aux_info.num_variables, 0);
+        }
+
+        // Verify each split evaluates to the original at the corresponding binary point
+        for split_idx in 0..(1 << nv) {
+            let mut binary_point = Vec::with_capacity(nv);
+            for bit in 0..nv {
+                let bit_val = ((split_idx >> bit) & 1) as u64;
+                binary_point.push(Fr::from(bit_val));
+            }
+
+            let expected = vp.evaluate(&binary_point)?;
+            let actual = splits[split_idx].evaluate(&[])?;
+
+            assert_eq!(expected, actual, "Mismatch at split_idx={}", split_idx);
+        }
+
+        Ok(())
     }
 }
