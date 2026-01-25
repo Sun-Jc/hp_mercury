@@ -723,6 +723,7 @@ mod test {
     use ark_std::test_rng;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::Instant;
 
     fn test_sumcheck(
         nv: usize,
@@ -955,15 +956,30 @@ mod test {
             .collect();
         let sums_clone = sums.clone();
 
-        // Run sum_fold (original)
+        // Run sum_fold (original) with timing
+        println!("\n=== sum_fold (original) ===");
+        let start1 = Instant::now();
         let mut transcript1 = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
         let (proof1, sum_t1, aux_info1, folded_poly1, v1) =
             <PolyIOP<Fr> as SumCheck<Fr>>::sum_fold(polys, sums, &mut transcript1)?;
+        let duration1 = start1.elapsed();
+        println!("sum_fold total: {:?}", duration1);
 
-        // Run sum_fold_v2 (optimized)
+        // Run sum_fold_v2 (optimized) with timing
+        println!("\n=== sum_fold_v2 (optimized) ===");
+        let start2 = Instant::now();
         let mut transcript2 = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
         let (proof2, sum_t2, aux_info2, folded_poly2, v2) =
             <PolyIOP<Fr> as SumCheck<Fr>>::sum_fold_v2(polys_clone, sums_clone, &mut transcript2)?;
+        let duration2 = start2.elapsed();
+        println!("sum_fold_v2 total: {:?}", duration2);
+
+        // Print comparison
+        let speedup = duration1.as_secs_f64() / duration2.as_secs_f64();
+        println!("\n=== COMPARISON (nv={}, m={}) ===", nv, m);
+        println!("  sum_fold:    {:?}", duration1);
+        println!("  sum_fold_v2: {:?}", duration2);
+        println!("  Speedup:     {:.2}x", speedup);
 
         // Compare proofs directly using PartialEq
         assert_eq!(
@@ -1069,13 +1085,26 @@ mod test {
                 .collect();
             let sums_clone = sums.clone();
 
+            // Run sum_fold (original) with timing
+            let start1 = Instant::now();
             let mut transcript1 = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
             let (proof1, sum_t1, _, folded_poly1, v1) =
                 <PolyIOP<Fr> as SumCheck<Fr>>::sum_fold(polys, sums, &mut transcript1)?;
+            let duration1 = start1.elapsed();
 
+            // Run sum_fold_v2 (optimized) with timing
+            let start2 = Instant::now();
             let mut transcript2 = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
             let (proof2, sum_t2, _, folded_poly2, v2) =
                 <PolyIOP<Fr> as SumCheck<Fr>>::sum_fold_v2(polys_clone, sums_clone, &mut transcript2)?;
+            let duration2 = start2.elapsed();
+
+            // Print timing comparison
+            let speedup = duration1.as_secs_f64() / duration2.as_secs_f64();
+            println!("\n=== Config (nv={}, m={}) ===", nv, m);
+            println!("  sum_fold:    {:?}", duration1);
+            println!("  sum_fold_v2: {:?}", duration2);
+            println!("  Speedup:     {:.2}x", speedup);
 
             // Direct proof comparison using PartialEq
             assert_eq!(
@@ -1097,6 +1126,107 @@ mod test {
                 );
             }
         }
+
+        Ok(())
+    }
+
+    /// Benchmark sum_fold vs sum_fold_v2 with multiple iterations for accurate timing.
+    /// Run with: cargo test -p subroutines --lib sum_check::test::bench_sum_fold --release -- --nocapture --ignored
+    #[test]
+    #[ignore] // Run manually with --ignored flag
+    fn bench_sum_fold_comparison() -> Result<(), PolyIOPErrors> {
+        let configs = [
+            (10, 4, 3, 2),   // nv=10, m=4
+            (12, 4, 3, 2),   // nv=12, m=4
+            (12, 8, 3, 2),   // nv=12, m=8
+            (14, 4, 3, 2),   // nv=14, m=4
+            (14, 8, 3, 2),   // nv=14, m=8
+        ];
+        let iterations = 10;
+
+        println!("\n╔════════════════════════════════════════════════════════════════════╗");
+        println!("║          sum_fold vs sum_fold_v2 Benchmark ({} iterations)         ║", iterations);
+        println!("╠════════════════════════════════════════════════════════════════════╣");
+        println!("║  Config      │ sum_fold (avg) │ sum_fold_v2 (avg) │ Speedup       ║");
+        println!("╠════════════════════════════════════════════════════════════════════╣");
+
+        for (nv, m, num_multiplicands, num_products) in configs {
+            let mut total_v1 = std::time::Duration::ZERO;
+            let mut total_v2 = std::time::Duration::ZERO;
+
+            for _ in 0..iterations {
+                let mut rng = test_rng();
+
+                // Create template
+                let (template, _) = VirtualPolynomial::<Fr>::rand(
+                    nv,
+                    (num_multiplicands, num_multiplicands + 1),
+                    num_products,
+                    &mut rng,
+                )?;
+
+                let mut polys = Vec::with_capacity(m);
+                let mut sums = Vec::with_capacity(m);
+
+                for _ in 0..m {
+                    let t = template.flattened_ml_extensions.len();
+                    let mut new_mles: Vec<Arc<DenseMultilinearExtension<Fr>>> = Vec::with_capacity(t);
+                    let mut raw_pointers_lookup_table = HashMap::new();
+
+                    for _ in 0..t {
+                        let mle = Arc::new(DenseMultilinearExtension::<Fr>::rand(nv, &mut rng));
+                        let mle_ptr = Arc::as_ptr(&mle);
+                        raw_pointers_lookup_table.insert(mle_ptr, new_mles.len());
+                        new_mles.push(mle);
+                    }
+
+                    let poly = VirtualPolynomial {
+                        aux_info: template.aux_info.clone(),
+                        products: template.products.clone(),
+                        flattened_ml_extensions: new_mles,
+                        raw_pointers_lookup_table,
+                    };
+
+                    let mut sum = Fr::zero();
+                    for (coefficient, product_indices) in poly.products.iter() {
+                        let mut product = Fr::one();
+                        for &idx in product_indices.iter() {
+                            let mle_sum: Fr = poly.flattened_ml_extensions[idx].evaluations.iter().sum();
+                            product *= mle_sum;
+                        }
+                        sum += *coefficient * product;
+                    }
+                    sums.push(sum);
+                    polys.push(poly);
+                }
+
+                let polys_clone: Vec<VirtualPolynomial<Fr>> = polys.iter().map(|p| p.deep_copy()).collect();
+                let sums_clone = sums.clone();
+
+                // Time sum_fold
+                let start1 = Instant::now();
+                let mut transcript1 = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
+                let _ = <PolyIOP<Fr> as SumCheck<Fr>>::sum_fold(polys, sums, &mut transcript1)?;
+                total_v1 += start1.elapsed();
+
+                // Time sum_fold_v2
+                let start2 = Instant::now();
+                let mut transcript2 = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
+                let _ = <PolyIOP<Fr> as SumCheck<Fr>>::sum_fold_v2(polys_clone, sums_clone, &mut transcript2)?;
+                total_v2 += start2.elapsed();
+            }
+
+            let avg_v1 = total_v1 / iterations as u32;
+            let avg_v2 = total_v2 / iterations as u32;
+            let speedup = avg_v1.as_secs_f64() / avg_v2.as_secs_f64();
+
+            println!(
+                "║  nv={:2}, m={} │ {:>13.3?} │ {:>17.3?} │ {:>6.2}x       ║",
+                nv, m, avg_v1, avg_v2, speedup
+            );
+        }
+
+        println!("╚════════════════════════════════════════════════════════════════════╝");
 
         Ok(())
     }
