@@ -339,6 +339,87 @@ fn fix_last_variable_helper<F: Field>(data: &[F], nv: usize, point: &F) -> Vec<F
     res
 }
 
+/// Threshold for switching to parallel execution in split operations.
+/// Based on empirical testing, parallelization overhead is worth it above this size.
+const PARALLEL_SPLIT_THRESHOLD: usize = 1 << 12; // 4096 elements
+
+/// Split an MLE into 2^n sub-MLEs by fixing the last n variables to all binary assignments.
+///
+/// For an MLE f(x_1, ..., x_m) with m variables, this produces 2^n MLEs:
+/// - split[0] = f(x_1, ..., x_{m-n}, 0, 0, ..., 0)
+/// - split[1] = f(x_1, ..., x_{m-n}, 1, 0, ..., 0)
+/// - split[2] = f(x_1, ..., x_{m-n}, 0, 1, ..., 0)
+/// - ...
+/// - split[2^n - 1] = f(x_1, ..., x_{m-n}, 1, 1, ..., 1)
+///
+/// # Memory Layout Assumption
+/// This function relies on the little-endian bit indexing used by `DenseMultilinearExtension`.
+/// The evaluation at index `i` corresponds to the point where binary digits of `i` give the
+/// variable assignments in order (x_1, x_2, ..., x_m). Thus, fixing the last n variables to
+/// assignment `j` corresponds to taking the j-th contiguous chunk of size 2^(m-n).
+///
+/// Automatically selects parallel or sequential execution based on data size.
+///
+/// # Arguments
+/// * `poly` - The multilinear extension to split
+/// * `n` - Number of last variables to fix (number of bits)
+///
+/// # Returns
+/// A vector of 2^n MLEs, each with (m-n) variables
+///
+/// # Panics
+/// Panics if n > num_vars
+pub fn split_by_last_variables<F: PrimeField>(
+    poly: &DenseMultilinearExtension<F>,
+    n: usize,
+) -> Vec<DenseMultilinearExtension<F>> {
+    let m = poly.num_vars;
+    assert!(n <= m, "n ({}) cannot exceed num_vars ({})", n, m);
+
+    if n == 0 {
+        return vec![poly.clone()];
+    }
+
+    let chunk_size = 1 << (m - n);
+
+    // Choose parallel or sequential based on total data size
+    #[cfg(feature = "parallel")]
+    if poly.evaluations.len() >= PARALLEL_SPLIT_THRESHOLD {
+        return split_by_last_variables_par(poly, n, chunk_size);
+    }
+
+    split_by_last_variables_seq(poly, n, chunk_size)
+}
+
+/// Sequential version of split_by_last_variables.
+fn split_by_last_variables_seq<F: PrimeField>(
+    poly: &DenseMultilinearExtension<F>,
+    n: usize,
+    chunk_size: usize,
+) -> Vec<DenseMultilinearExtension<F>> {
+    let new_num_vars = poly.num_vars - n;
+    poly.evaluations
+        .chunks(chunk_size)
+        .map(|chunk| DenseMultilinearExtension::from_evaluations_vec(new_num_vars, chunk.to_vec()))
+        .collect()
+}
+
+/// Parallel version of split_by_last_variables using par_chunks.
+#[cfg(feature = "parallel")]
+fn split_by_last_variables_par<F: PrimeField>(
+    poly: &DenseMultilinearExtension<F>,
+    n: usize,
+    chunk_size: usize,
+) -> Vec<DenseMultilinearExtension<F>> {
+    use rayon::prelude::ParallelSlice;
+
+    let new_num_vars = poly.num_vars - n;
+    poly.evaluations
+        .par_chunks(chunk_size)
+        .map(|chunk| DenseMultilinearExtension::from_evaluations_vec(new_num_vars, chunk.to_vec()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,6 +513,79 @@ mod tests {
                 "nv={}: fix_variables={:?}, fix_variables_in_place={:?}, speedup={:.2}x",
                 nv, alloc_time, in_place_time, speedup
             );
+        }
+    }
+
+    /// Test split_by_last_variables produces correct evaluations
+    #[test]
+    fn test_split_by_last_variables_correctness() {
+        let mut rng = test_rng();
+        let m = 6; // Total variables
+
+        for n in 0..=4 {
+            let evals: Vec<Fr> = (0..(1 << m)).map(|_| Fr::rand(&mut rng)).collect();
+            let poly = DenseMultilinearExtension::from_evaluations_vec(m, evals);
+
+            let splits = split_by_last_variables(&poly, n);
+
+            assert_eq!(splits.len(), 1 << n);
+            for split in &splits {
+                assert_eq!(split.num_vars, m - n);
+            }
+
+            // Verify evaluation consistency:
+            // For a random point (x_1, ..., x_{m-n}), evaluate both:
+            // 1. Original poly at (x_1, ..., x_{m-n}, b_1, ..., b_n) where b encodes split index
+            // 2. Split poly at (x_1, ..., x_{m-n})
+            let point: Vec<Fr> = (0..(m - n)).map(|_| Fr::rand(&mut rng)).collect();
+
+            for split_idx in 0..(1 << n) {
+                // Build full point by appending binary assignment for split_idx
+                let mut full_point = point.clone();
+                for bit in 0..n {
+                    let bit_val = ((split_idx >> bit) & 1) as u64;
+                    full_point.push(Fr::from(bit_val));
+                }
+
+                let expected = evaluate_opt(&poly, &full_point);
+                let actual = evaluate_opt(&splits[split_idx], &point);
+
+                assert_eq!(expected, actual, "Mismatch at split_idx={}, n={}", split_idx, n);
+            }
+        }
+    }
+
+    /// Test edge case: n = 0 returns a clone
+    #[test]
+    fn test_split_by_last_variables_n_zero() {
+        let mut rng = test_rng();
+        let nv = 5;
+        let evals: Vec<Fr> = (0..(1 << nv)).map(|_| Fr::rand(&mut rng)).collect();
+        let poly = DenseMultilinearExtension::from_evaluations_vec(nv, evals);
+
+        let splits = split_by_last_variables(&poly, 0);
+
+        assert_eq!(splits.len(), 1);
+        assert_eq!(splits[0].num_vars, nv);
+        assert_eq!(splits[0].evaluations, poly.evaluations);
+    }
+
+    /// Test edge case: n = num_vars returns 2^m scalar constants
+    #[test]
+    fn test_split_by_last_variables_n_equals_num_vars() {
+        let mut rng = test_rng();
+        let nv = 4;
+        let evals: Vec<Fr> = (0..(1 << nv)).map(|_| Fr::rand(&mut rng)).collect();
+        let poly = DenseMultilinearExtension::from_evaluations_vec(nv, evals.clone());
+
+        let splits = split_by_last_variables(&poly, nv);
+
+        assert_eq!(splits.len(), 1 << nv);
+        for (i, split) in splits.iter().enumerate() {
+            assert_eq!(split.num_vars, 0);
+            assert_eq!(split.evaluations.len(), 1);
+            // Each split should contain the evaluation at index i
+            assert_eq!(split.evaluations[0], evals[i]);
         }
     }
 }
