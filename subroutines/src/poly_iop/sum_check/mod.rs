@@ -26,6 +26,9 @@ use ark_std::time::Instant;
 mod prover;
 mod verifier;
 
+#[cfg(feature = "distributed")]
+pub mod dist_sum_fold;
+
 /// Trait for doing sum check protocols.
 pub trait SumCheck<F: PrimeField> {
     type VirtualPolynomial;
@@ -72,6 +75,16 @@ pub trait SumCheck<F: PrimeField> {
     /// Optimized version of sum_fold with MLE transform and reduced allocations.
     /// Produces identical results to sum_fold but with better performance.
     fn sum_fold_v2(
+        polys: Vec<VirtualPolynomial<F>>,
+        sums: Vec<F>,
+        transcript: &mut IOPTranscript<F>,
+    ) -> Result<(Self::SumCheckProof, F, VPAuxInfo<F>, VirtualPolynomial<F>, F), PolyIOPErrors>;
+
+    /// Split-and-merge version of sum_fold using VirtualPolynomial::split_by_last_variables.
+    /// 
+    /// Strategy: m VPs → split each by last `length` vars → m² sub-VPs → merge by split index → m merged VPs
+    /// Uses sequential execution and eq-weighted sums.
+    fn sum_fold_v3(
         polys: Vec<VirtualPolynomial<F>>,
         sums: Vec<F>,
         transcript: &mut IOPTranscript<F>,
@@ -712,7 +725,344 @@ impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
 
         Ok((proof, sum_t, q_aux_info, folded_poly, v))
     }
+
+    /// Split-and-merge version of sum_fold using VirtualPolynomial::split_by_last_variables.
+    ///
+    /// Strategy: m VPs → split each by last `length` vars → m² sub-VPs → merge by split index → m merged VPs
+    ///
+    /// # Split-and-Merge Example (m=4, t=2 MLEs each)
+    ///
+    /// ## Before Splitting: 4 VPs
+    /// ```text
+    /// VP₀, VP₁, VP₂, VP₃
+    /// ```
+    ///
+    /// ## After Splitting: 16 sub-VPs (split by last 2 variables)
+    /// ```text
+    /// VP₀ → [VP₀[0], VP₀[1], VP₀[2], VP₀[3]]
+    /// VP₁ → [VP₁[0], VP₁[1], VP₁[2], VP₁[3]]
+    /// VP₂ → [VP₂[0], VP₂[1], VP₂[2], VP₂[3]]
+    /// VP₃ → [VP₃[0], VP₃[1], VP₃[2], VP₃[3]]
+    /// ```
+    ///
+    /// ## After Merging: 4 Merged VPs (group by split index, interleave MLEs)
+    /// ```text
+    /// Merged[0] = interleave(VP₀[0], VP₁[0], VP₂[0], VP₃[0])
+    /// Merged[1] = interleave(VP₀[1], VP₁[1], VP₂[1], VP₃[1])
+    /// Merged[2] = interleave(VP₀[2], VP₁[2], VP₂[2], VP₃[2])
+    /// Merged[3] = interleave(VP₀[3], VP₁[3], VP₂[3], VP₃[3])
+    /// ```
+    ///
+    /// Uses sequential execution and eq-weighted sums for sum_t computation.
+    fn sum_fold_v3(
+        polys: Vec<VirtualPolynomial<F>>,
+        sums: Vec<F>,
+        transcript: &mut IOPTranscript<F>,
+    ) -> Result<(Self::SumCheckProof, F, VPAuxInfo<F>, VirtualPolynomial<F>, F), PolyIOPErrors> {
+        let m = polys.len();
+        let t = polys[0].flattened_ml_extensions.len();
+        let num_vars = polys[0].aux_info.num_variables;
+        let length = log2(m) as usize;
+
+        // ═══════════════════════════════════════════════════════════════
+        // Stage 1: Setup and Challenge Generation
+        // ═══════════════════════════════════════════════════════════════
+        let q_aux_info = VPAuxInfo::<F> {
+            max_degree: polys[0].aux_info.max_degree + 1,
+            num_variables: length,
+            phantom: PhantomData::default(),
+        };
+
+        transcript.append_serializable_element(b"aux info", &q_aux_info)?;
+        let rho: Vec<F> = transcript.get_and_append_challenge_vectors(b"sumfold rho", length)?;
+        let eq_poly = EqPolynomial::new(rho.clone());
+        let eq_xr_poly = build_eq_x_r(&rho)?;
+        let eq_xr_vec = eq_xr_poly.to_evaluations();
+
+        // ═══════════════════════════════════════════════════════════════
+        // Stage 2: Split VPs and compute sum_t with eq-weighted sums
+        // ═══════════════════════════════════════════════════════════════
+        // Split each VP by last `length` variables
+        // VP_i splits into m sub-VPs: VP_i[0], VP_i[1], ..., VP_i[m-1]
+        let all_splits: Vec<Vec<VirtualPolynomial<F>>> = polys
+            .iter()
+            .map(|vp| vp.split_by_last_variables(length))
+            .collect();
+
+        // Compute sum_t = Σᵢ eq(rho, i) * sums[i]
+        let sum_t = stage2_compute_sum_t(&sums, &eq_xr_vec);
+
+        // ═══════════════════════════════════════════════════════════════
+        // Stage 3: Merge split MLEs across VPs for each split index
+        // ═══════════════════════════════════════════════════════════════
+        // For each split index s, interleave MLEs from all m VPs
+        let new_num_vars = length + num_vars;
+        let merged_mles = stage3_merge_split_mles(&all_splits, m, t, new_num_vars);
+
+        // ═══════════════════════════════════════════════════════════════
+        // Stage 4: Build composed VirtualPolynomial
+        // ═══════════════════════════════════════════════════════════════
+        let compose_poly = stage4_compose_poly(
+            merged_mles,
+            polys[0].products.clone(),
+            polys[0].aux_info.max_degree + 1,
+            new_num_vars,
+        );
+
+        // Precompute barycentric weights for extrapolation
+        let extrapolation_aux: Vec<(Vec<F>, Vec<F>)> = (1..compose_poly.aux_info.max_degree)
+            .map(|degree| {
+                let points = (0..1 + degree as u64).map(F::from).collect::<Vec<_>>();
+                let weights = barycentric_weights(&points);
+                (points, weights)
+            })
+            .collect();
+
+        // ═══════════════════════════════════════════════════════════════
+        // Stage 5: Sumcheck rounds (sequential)
+        // ═══════════════════════════════════════════════════════════════
+        let mut challenge = None;
+        let mut prover_msgs = Vec::with_capacity(length);
+        let mut challenges = Vec::with_capacity(length);
+        let mut eq_fix = eq_xr_poly.as_ref().clone();
+
+        // Clone MLEs for mutation (sequential)
+        let mut flattened_ml_extensions: Vec<DenseMultilinearExtension<F>> = compose_poly
+            .flattened_ml_extensions
+            .iter()
+            .map(|x| x.as_ref().clone())
+            .collect();
+
+        let products_list = compose_poly.products.clone();
+
+        for round in 0..length {
+            if let Some(chal) = challenge {
+                if round == 0 {
+                    return Err(PolyIOPErrors::InvalidProver(
+                        "first round should be prover first.".to_string(),
+                    ));
+                }
+                challenges.push(chal);
+
+                let r = challenges[round - 1];
+                // Sequential fix_variables
+                flattened_ml_extensions
+                    .iter_mut()
+                    .for_each(|mle| *mle = fix_variables(mle, &[r]));
+                eq_fix = fix_variables(&eq_fix, &[r]);
+            } else if round > 0 {
+                return Err(PolyIOPErrors::InvalidProver(
+                    "verifier message is empty".to_string(),
+                ));
+            }
+
+            let mut products_sum = vec![F::zero(); compose_poly.aux_info.max_degree + 1];
+
+            // Compute eq_sum for this round (sequential)
+            let mut eq_sum = vec![vec![F::zero(); 1 << (length - round - 1)]; compose_poly.aux_info.max_degree + 1];
+            for b in 0..1 << (length - round - 1) {
+                let table = &eq_fix;
+                let mut eval = table[b << 1];
+                let step = table[(b << 1) + 1] - table[b << 1];
+
+                eq_sum[0][b] = eval;
+
+                eq_sum[1..].iter_mut().for_each(|acc| {
+                    eval += step;
+                    acc[b] = eval;
+                });
+            }
+
+            // Sequential product accumulation
+            for (coefficient, products) in products_list.iter() {
+                let mut sum = vec![F::zero(); products.len() + 2];
+                let mut partial_acc = vec![vec![F::zero(); 1 << (length - round - 1)]; products.len() + 2];
+
+                for b in 0..1 << (compose_poly.aux_info.num_variables - round - 1) {
+                    let mut buf: Vec<(F, F)> = vec![(F::zero(), F::zero()); products.len()];
+
+                    buf.iter_mut()
+                        .zip(products.iter())
+                        .for_each(|((eval, step), f)| {
+                            let table = &flattened_ml_extensions[*f];
+                            *eval = table[b << 1];
+                            *step = table[(b << 1) + 1] - table[b << 1];
+                        });
+
+                    let bucket = b % (1 << (length - round - 1));
+                    partial_acc[0][bucket] += buf.iter().map(|(eval, _)| eval).product::<F>();
+
+                    for acc_idx in 1..partial_acc.len() {
+                        buf.iter_mut().for_each(|(eval, step)| *eval += *step);
+                        partial_acc[acc_idx][bucket] += buf.iter().map(|(eval, _)| eval).product::<F>();
+                    }
+                }
+
+                // Apply eq_sum weights
+                for (i, partial_row) in partial_acc.iter().enumerate() {
+                    if i < eq_sum.len() {
+                        sum[i] = eq_sum[i]
+                            .iter()
+                            .zip(partial_row.iter())
+                            .map(|(a, b)| *a * *b)
+                            .sum::<F>();
+                    }
+                }
+
+                sum.iter_mut().for_each(|s| *s *= coefficient);
+
+                // Extrapolate remaining degrees
+                for i in 0..compose_poly.aux_info.max_degree - products.len() - 1 {
+                    let (points, weights) = &extrapolation_aux[products.len()];
+                    let at = F::from((products.len() + 2 + i) as u64);
+                    let extra = extrapolate(points, weights, &sum, &at);
+                    if products.len() + 2 + i < products_sum.len() {
+                        products_sum[products.len() + 2 + i] += extra;
+                    }
+                }
+
+                for (i, s) in sum.iter().enumerate() {
+                    if i < products_sum.len() {
+                        products_sum[i] += *s;
+                    }
+                }
+            }
+
+            let message = IOPProverMessage {
+                evaluations: products_sum,
+            };
+            transcript.append_serializable_element(b"prover msg", &message)?;
+            prover_msgs.push(message);
+            challenge = Some(transcript.get_and_append_challenge(b"Internal round")?);
+        }
+
+        // Push the last challenge
+        if let Some(p) = challenge {
+            challenges.push(p);
+        }
+
+        let proof = IOPProof {
+            point: challenges,
+            proofs: prover_msgs,
+        };
+
+        let final_round_proof = proof.proofs[length - 1].evaluations.clone();
+        let final_challenge = proof.point[length - 1];
+        let c = interpolate_uni_poly::<F>(&final_round_proof, final_challenge);
+        let rb = proof.point.clone();
+
+        // ═══════════════════════════════════════════════════════════════
+        // Stage 6: Compute folded polynomial via fix_variables
+        // ═══════════════════════════════════════════════════════════════
+        let v = c * eq_poly.evaluate(&rb).inverse().unwrap();
+
+        // Apply final challenge to get folded MLEs (sequential)
+        let final_challenge_val = rb[length - 1];
+        let new_mle: Vec<Arc<DenseMultilinearExtension<F>>> = flattened_ml_extensions
+            .iter()
+            .map(|mle| Arc::new(fix_variables(mle, &[final_challenge_val])))
+            .collect();
+
+        let mut hm = HashMap::new();
+        for (j, mle) in new_mle.iter().enumerate() {
+            let mle_ptr = Arc::as_ptr(mle);
+            hm.insert(mle_ptr, j);
+        }
+
+        let folded_poly = VirtualPolynomial {
+            aux_info: polys[0].aux_info.clone(),
+            products: polys[0].products.clone(),
+            flattened_ml_extensions: new_mle,
+            raw_pointers_lookup_table: hm,
+        };
+
+        Ok((proof, sum_t, q_aux_info, folded_poly, v))
+    }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Stage helper functions for sum_fold_v3
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Stage 2: Compute sum_t = Σᵢ eq(rho, i) * sums[i]
+fn stage2_compute_sum_t<F: PrimeField>(sums: &[F], eq_xr_vec: &[F]) -> F {
+    sums.iter()
+        .zip(eq_xr_vec.iter())
+        .map(|(s, eq)| *s * *eq)
+        .sum()
+}
+
+/// Stage 3: Merge split MLEs across VPs for interleaved structure
+///
+/// For each MLE index j, produce a merged MLE with (length + num_vars) variables.
+/// The interleaving follows sum_fold_v2's layout:
+///   merged_evals[k * m + i] = original_polys[i].mle[j].evals[k]
+///
+/// After splitting by last `length` vars:
+///   all_splits[i][s].mle[j].evals[x'] = original_polys[i].mle[j].evals[s * chunk_size + x']
+///   where chunk_size = 2^(num_vars - length)
+///
+/// So we iterate: for s in 0..num_splits, for x' in 0..chunk_size, for i in 0..m
+/// This produces k = s * chunk_size + x' in correct order.
+fn stage3_merge_split_mles<F: PrimeField>(
+    all_splits: &[Vec<VirtualPolynomial<F>>],
+    m: usize,
+    t: usize,
+    new_num_vars: usize,
+) -> Vec<Arc<DenseMultilinearExtension<F>>> {
+    let num_splits = all_splits[0].len();
+    let split_num_vars = all_splits[0][0].aux_info.num_variables;
+    let chunk_size = 1 << split_num_vars;
+
+    let mut merged_mles = Vec::with_capacity(t);
+
+    for j in 0..t {
+        // Total evaluations = m * num_splits * chunk_size = m * 2^num_vars
+        let total_len = m * num_splits * chunk_size;
+        let mut f = Vec::with_capacity(total_len);
+
+        // Iterate to produce k = s * chunk_size + x' in order
+        // This matches sum_fold_v2's: for k in 0..eval_len, for i in 0..m
+        for s in 0..num_splits {
+            for x_prime in 0..chunk_size {
+                for i in 0..m {
+                    f.push(all_splits[i][s].flattened_ml_extensions[j].evaluations[x_prime]);
+                }
+            }
+        }
+
+        let mle = Arc::new(DenseMultilinearExtension::from_evaluations_vec(new_num_vars, f));
+        merged_mles.push(mle);
+    }
+
+    merged_mles
+}
+
+/// Stage 4: Build composed VirtualPolynomial from merged MLEs
+fn stage4_compose_poly<F: PrimeField>(
+    merged_mles: Vec<Arc<DenseMultilinearExtension<F>>>,
+    products: Vec<(F, Vec<usize>)>,
+    max_degree: usize,
+    num_variables: usize,
+) -> VirtualPolynomial<F> {
+    let mut hm = HashMap::new();
+    for (j, mle) in merged_mles.iter().enumerate() {
+        let mle_ptr = Arc::as_ptr(mle);
+        hm.insert(mle_ptr, j);
+    }
+
+    VirtualPolynomial {
+        aux_info: VPAuxInfo {
+            max_degree,
+            num_variables,
+            phantom: PhantomData::default(),
+        },
+        products,
+        flattened_ml_extensions: merged_mles,
+        raw_pointers_lookup_table: hm,
+    }
+}
+
 #[cfg(test)]
 mod test {
 
@@ -1227,6 +1577,129 @@ mod test {
         }
 
         println!("╚════════════════════════════════════════════════════════════════════╝");
+
+        Ok(())
+    }
+
+    /// Test that sum_fold_v3 produces identical results to sum_fold_v2.
+    /// Validates the split-and-merge strategy produces equivalent output.
+    #[test]
+    fn test_sum_fold_v3_equivalence() -> Result<(), PolyIOPErrors> {
+        let mut rng = test_rng();
+        let nv = 10;
+        let m = 4; // number of polynomials (must be power of 2)
+        let num_multiplicands = 3;
+        let num_products = 2;
+
+        // Generate m virtual polynomials with the SAME structure
+        let (template, _) = VirtualPolynomial::<Fr>::rand(
+            nv,
+            (num_multiplicands, num_multiplicands + 1),
+            num_products,
+            &mut rng,
+        )?;
+
+        let mut polys = Vec::with_capacity(m);
+        let mut sums = Vec::with_capacity(m);
+
+        for _ in 0..m {
+            let t = template.flattened_ml_extensions.len();
+            let mut new_mles: Vec<Arc<DenseMultilinearExtension<Fr>>> = Vec::with_capacity(t);
+            let mut raw_pointers_lookup_table = HashMap::new();
+
+            for _ in 0..t {
+                let mle = Arc::new(DenseMultilinearExtension::<Fr>::rand(nv, &mut rng));
+                let mle_ptr = Arc::as_ptr(&mle);
+                raw_pointers_lookup_table.insert(mle_ptr, new_mles.len());
+                new_mles.push(mle);
+            }
+
+            let poly = VirtualPolynomial {
+                aux_info: template.aux_info.clone(),
+                products: template.products.clone(),
+                flattened_ml_extensions: new_mles,
+                raw_pointers_lookup_table,
+            };
+
+            // Compute sum for this polynomial
+            let mut sum = Fr::zero();
+            for (coefficient, product_indices) in poly.products.iter() {
+                let mut product = Fr::one();
+                for &idx in product_indices.iter() {
+                    let mle_sum: Fr = poly.flattened_ml_extensions[idx].evaluations.iter().sum();
+                    product *= mle_sum;
+                }
+                sum += *coefficient * product;
+            }
+            sums.push(sum);
+            polys.push(poly);
+        }
+
+        // Clone for v3 call
+        let polys_clone: Vec<VirtualPolynomial<Fr>> =
+            polys.iter().map(|p| p.deep_copy()).collect();
+        let sums_clone = sums.clone();
+
+        // Run sum_fold_v2
+        println!("\n=== sum_fold_v2 ===");
+        let start2 = Instant::now();
+        let mut transcript2 = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
+        let (proof2, sum_t2, aux_info2, folded_poly2, v2) =
+            <PolyIOP<Fr> as SumCheck<Fr>>::sum_fold_v2(polys, sums, &mut transcript2)?;
+        let duration2 = start2.elapsed();
+        println!("sum_fold_v2 total: {:?}", duration2);
+
+        // Run sum_fold_v3
+        println!("\n=== sum_fold_v3 (split-merge) ===");
+        let start3 = Instant::now();
+        let mut transcript3 = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
+        let (proof3, sum_t3, aux_info3, folded_poly3, v3) =
+            <PolyIOP<Fr> as SumCheck<Fr>>::sum_fold_v3(polys_clone, sums_clone, &mut transcript3)?;
+        let duration3 = start3.elapsed();
+        println!("sum_fold_v3 total: {:?}", duration3);
+
+        // Print comparison
+        println!("\n=== COMPARISON (nv={}, m={}) ===", nv, m);
+        println!("  sum_fold_v2: {:?}", duration2);
+        println!("  sum_fold_v3: {:?}", duration3);
+
+        // Compare sum_t
+        assert_eq!(sum_t2, sum_t3, "sum_t values must match");
+
+        // Compare v
+        assert_eq!(v2, v3, "v values must match");
+
+        // Compare aux_info
+        assert_eq!(
+            aux_info2.max_degree, aux_info3.max_degree,
+            "aux_info max_degree must match"
+        );
+        assert_eq!(
+            aux_info2.num_variables, aux_info3.num_variables,
+            "aux_info num_variables must match"
+        );
+
+        // Compare proofs
+        assert_eq!(
+            proof2, proof3,
+            "sum_fold_v2 and sum_fold_v3 proofs must be identical"
+        );
+
+        // Compare folded polynomial evaluations
+        assert_eq!(
+            folded_poly2.flattened_ml_extensions.len(),
+            folded_poly3.flattened_ml_extensions.len(),
+            "folded_poly MLE count must match"
+        );
+
+        for j in 0..folded_poly2.flattened_ml_extensions.len() {
+            assert_eq!(
+                folded_poly2.flattened_ml_extensions[j].evaluations,
+                folded_poly3.flattened_ml_extensions[j].evaluations,
+                "folded_poly MLE[{}] evaluations must match",
+                j
+            );
+        }
 
         Ok(())
     }
