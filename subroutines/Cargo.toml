@@ -6,11 +6,13 @@ edition = "2021"
 
 [dependencies]
 arithmetic = { path = "../arithmetic" }
-ark-bls12-381 = { version = "0.4.0", default-features = false, features = [ "curve" ] }
+ark-bls12-381 = { version = "0.4.0", default-features = false, features = [
+    "curve",
+] }
 ark-ec = { version = "^0.4.0", default-features = false }
 ark-ff = { version = "^0.4.0", default-features = false }
 ark-poly = { version = "^0.4.0", default-features = false }
-ark-serialize =  { version = "^0.4.0", default-features = false }
+ark-serialize = { version = "^0.4.0", default-features = false }
 ark-std = { version = "^0.4.0", default-features = false }
 derivative = { version = "2", features = ["use_core"] }
 displaydoc = { version = "0.2.3", default-features = false }
@@ -20,7 +22,9 @@ rayon = { version = "1.5.2", default-features = false, optional = true }
 transcript = { path = "../transcript" }
 util = { path = "../util" }
 env_logger = "0.11.8"
+log = "0.4"
 ark-poly-commit = "0.4.0"
+deNetwork = { path = "../deNetwork", optional = true }
 
 ark-bls12-377 = "0.4"
 ark-bn254 = "0.4"
@@ -38,22 +42,25 @@ name = "pcs-benches"
 path = "benches/pcs_bench.rs"
 harness = false
 
+[[example]]
+name = "dist_sum_fold_demo"
+required-features = ["distributed"]
+
+
 [features]
 # default = [ "parallel", "print-trace" ]
 default = ["parallel"]
 # extensive sanity checks that are useful for debugging
-extensive_sanity_checks = [ ]
-parallel = [ 
+extensive_sanity_checks = []
+distributed = ["deNetwork"]
+parallel = [
     "rayon",
     "itertools",
-    "ark-std/parallel", 
-    "ark-ff/parallel",  
-    "ark-poly/parallel", 
+    "ark-std/parallel",
+    "ark-ff/parallel",
+    "ark-poly/parallel",
     "ark-ec/parallel",
     "util/parallel",
     "arithmetic/parallel",
-    ]
-print-trace = [ 
-    "arithmetic/print-trace",
-    "ark-std/print-trace",
-    ] 
+]
+print-trace = ["arithmetic/print-trace", "ark-std/print-trace"]
