@@ -1,0 +1,43 @@
+[package]
+name = "deSnark"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arithmetic = { path = "../arithmetic" }
+ark-ec = { version = "^0.4.0", default-features = false }
+ark-ff = { version = "^0.4.0", default-features = false }
+ark-poly = { version = "^0.4.0", default-features = false }
+ark-serialize = { version = "^0.4.0", default-features = false, features = [
+    "derive",
+] }
+ark-std = { version = "^0.4.0", default-features = false }
+displaydoc = { version = "0.2.3", default-features = false }
+rayon = { version = "1.5.2" }
+subroutines = { path = "../subroutines" }
+transcript = { path = "../transcript" }
+util = { path = "../util" }
+deNetwork = { path = "../deNetwork" }
+
+[dev-dependencies]
+ark-bls12-381 = { version = "0.4.0", default-features = false, features = [
+    "curve",
+] }
+ark-bn254 = { version = "0.4.0", features = ["asm"] }
+
+[features]
+default = ["parallel"]
+parallel = [
+    "ark-std/parallel",
+    "ark-ff/parallel",
+    "ark-poly/parallel",
+    "ark-ec/parallel",
+    "arithmetic/parallel",
+    "subroutines/parallel",
+    "util/parallel",
+]
+print-trace = [
+    "ark-std/print-trace",
+    "arithmetic/print-trace",
+    "subroutines/print-trace",
+]
