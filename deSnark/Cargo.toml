@@ -32,6 +32,10 @@ ark-bn254 = { version = "0.4.0", features = ["asm"] }
 env_logger = "0.11"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
+[[bench]]
+name = "bench"
+harness = false
+
 [features]
 default = ["parallel"]
 parallel = [

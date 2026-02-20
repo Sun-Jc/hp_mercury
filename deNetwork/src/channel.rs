@@ -114,7 +114,9 @@ pub trait DeSerNet: DeNet {
 
 impl<N: DeNet> DeSerNet for N {}
 
-const ALLOW_CHEATING: Cell<bool> = Cell::new(true);
+thread_local! {
+    static ALLOW_CHEATING: Cell<bool> = const { Cell::new(true) };
+}
 
 /// Number of randomness bytes to use in the commitment scheme
 const COMMIT_RAND_BYTES: usize = 32;
@@ -157,12 +159,12 @@ pub fn atomic_exchange<F: CanonicalSerialize + CanonicalDeserialize>(f: &F) -> F
 
 #[inline]
 pub fn can_cheat() -> bool {
-    ALLOW_CHEATING.get()
+    ALLOW_CHEATING.with(|c| c.get())
 }
 
 #[inline]
 pub fn set_cheating_allowed(allowed: bool) {
-    ALLOW_CHEATING.set(allowed)
+    ALLOW_CHEATING.with(|c| c.set(allowed))
 }
 
 #[inline]

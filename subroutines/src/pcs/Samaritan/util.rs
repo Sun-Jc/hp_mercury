@@ -17,7 +17,7 @@ use ark_ec::{
 
 use crate::pcs::Samaritan::srs::SamaritanProverParam;
 use ark_std::vec::Vec;
-use ark_std::{log2, string::ToString, test_rng, vec};
+use ark_std::{log2, string::ToString, vec};
 use std:: collections::HashMap;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use crate::PCSError;
@@ -28,6 +28,7 @@ use ark_poly_commit::kzg10::Proof;
 type MultiPoly<F> = HashMap<(usize, usize), F>;
 
 
+#[allow(dead_code)]
 /// Generate eq(t,x), a product of multilinear polynomials with fixed t.
 /// eq(a,b) is takes extensions of a,b in {0,1}^num_vars such that if a and b in
 /// {0,1}^num_vars are equal then this polynomial evaluates to 1.
@@ -78,9 +79,6 @@ where
     E::G1Affine: CanonicalSerialize + CanonicalDeserialize,
     E::G2Affine: CanonicalSerialize + CanonicalDeserialize,
 {
-    let mut rng = test_rng();
-
-    let degree = f.degree();
     let (num_leading_zeros, plain_coeffs) = skip_leading_zeros(f);
     let commitment =
             E::G1::msm_unchecked(&pp.powers_of_g[num_leading_zeros..], plain_coeffs)
@@ -88,7 +86,7 @@ where
     Ok(Commitment(commitment))
 }
 pub(crate) fn trim_trailing_zeros<F: Field>(mut coeffs: Vec<F>) -> Vec<F> {
-    while coeffs.len() > 1 && coeffs.last().map_or(false, |c| c.is_zero()) {
+    while coeffs.len() > 1 && coeffs.last().is_some_and(|c| c.is_zero()) {
         coeffs.pop();
     }
     coeffs
@@ -97,11 +95,11 @@ pub(crate) fn compute_f_hat<F: Field>(evaluations: &[F], num_vars: usize) -> Vec
     let n = num_vars;
     let mut f_hat_coeffs = vec![F::zero(); 1 << n];
 
-    for i in 0..(1 << n) {
+    for (i, f_hat_coeff) in f_hat_coeffs.iter_mut().enumerate().take(1 << n) {
         let index = (0..n)
             .map(|k| (i >> k) & 1)
             .fold(0, |acc, bit| (acc << 1) | bit);
-        f_hat_coeffs[i] = evaluations[index];
+        *f_hat_coeff = evaluations[index];
     }
 
     f_hat_coeffs
@@ -113,19 +111,17 @@ pub(crate) fn generate_ghat<F: Field>(f_coeffs: &[F], miu: u32) -> Vec<DensePoly
     let m = n / l;
 
     let mut f_matrix: Vec<Vec<F>> = vec![vec![F::zero(); m]; l];
-    for i in 0..l {
-        for j in 0..m {
+    for (i, f_row) in f_matrix.iter_mut().enumerate().take(l) {
+        for (j, f_cell) in f_row.iter_mut().enumerate().take(m) {
             let index = i * m + j;
-            f_matrix[i][j] = f_coeffs[index];
+            *f_cell = f_coeffs[index];
         }
     }
 
-    let g_hat: Vec<DensePolynomial<F>> = f_matrix
+    f_matrix
         .iter()
         .map(|row| DensePolynomial::from_coefficients_vec(row.clone()))
-        .collect();
-
-    g_hat
+        .collect()
 }
 
 pub(crate) fn compute_q<F: Field>(g_vec: &[DensePolynomial<F>], l: usize) -> MultiPoly<F> {
@@ -164,11 +160,10 @@ pub(crate) fn compute_gtilde<F: Field>(
             }
         })
         .collect();
-    let g_tilde = f_poly.fix_variables(&i_binary);
-    g_tilde
+    f_poly.fix_variables(&i_binary)
 }
 
-pub(crate) fn kron<F: Field>(v1: &Vec<F>, v2: &Vec<F>) -> Vec<F> {
+pub(crate) fn kron<F: Field>(v1: &[F], v2: &[F]) -> Vec<F> {
     let mut result = Vec::with_capacity(v1.len() * v2.len());
     for x in v1 {
         for y in v2 {
@@ -179,7 +174,6 @@ pub(crate) fn kron<F: Field>(v1: &Vec<F>, v2: &Vec<F>) -> Vec<F> {
 }
 
 pub(crate) fn compute_psihat<F: PrimeField>(z: &[F]) -> DensePolynomial<F> {
-    let mut psi_hat = DensePolynomial::from_coefficients_vec(vec![F::one()]);
     let mu = z.len();
     let mut phi = vec![F::one() - z[0], z[0]];
     for i in 1..mu {
@@ -187,8 +181,7 @@ pub(crate) fn compute_psihat<F: PrimeField>(z: &[F]) -> DensePolynomial<F> {
         phi = kron(&phi, &next_vector);
     }
     phi.reverse();
-    psi_hat = DensePolynomial::from_coefficients_vec(phi);
-    psi_hat
+    DensePolynomial::from_coefficients_vec(phi)
 }
 
 pub(crate) fn compute_phat<F: PrimeField>(q_poly: MultiPoly<F>, gamma: F) -> DensePolynomial<F> {
@@ -207,10 +200,7 @@ pub(crate) fn compute_phat<F: PrimeField>(q_poly: MultiPoly<F>, gamma: F) -> Den
     }
 }
 
-pub(crate) fn compute_r<F: Field>(q_poly: MultiPoly<F>, gamma: F) -> MultiPoly<F>
-where
-    F: std::ops::MulAssign + std::ops::AddAssign + Copy + PartialEq,
-{
+pub(crate) fn compute_r<F: Field>(q_poly: MultiPoly<F>, gamma: F) -> MultiPoly<F> {
     let mut r_poly: MultiPoly<F> = HashMap::new();
     for (&(x_deg, y_deg), &coeff) in &q_poly {
         if x_deg == 0 {
@@ -229,10 +219,7 @@ where
     r_poly
 }
 
-pub(crate) fn compute_r_hat<F: Field>(r_poly: MultiPoly<F>, m: usize) -> DensePolynomial<F>
-where
-    F: std::ops::MulAssign + std::ops::AddAssign + Copy + PartialEq,
-{
+pub(crate) fn compute_r_hat<F: Field>(r_poly: MultiPoly<F>, m: usize) -> DensePolynomial<F> {
     let max_deg = std::iter::Iterator::max(
         r_poly
             .keys()
@@ -328,9 +315,7 @@ pub(crate) fn compute_t<F: PrimeField>(
     let term3 = multiply_by_scalar(&term3_base, beta_squared);
 
     let sum1 = add_polynomials(&term1, &term2);
-    let result = add_polynomials(&sum1, &term3);
-
-    result
+    add_polynomials(&sum1, &term3)
 }
 
 pub(crate) fn kzg_prove<E: Pairing>(
@@ -360,13 +345,12 @@ where
     q_coeffs[0] -= v;
 
     let mut quotient = Vec::with_capacity(q_coeffs.len().saturating_sub(1));
-    let mut remainder = E::ScalarField::zero();
     for i in (1..q_coeffs.len()).rev() {
         let leading_coeff = q_coeffs[i];
         quotient.push(leading_coeff);
         q_coeffs[i - 1] += leading_coeff * alpha;
     }
-    remainder = q_coeffs[0];
+    let remainder = q_coeffs[0];
 
     if !remainder.is_zero() {
         return Err(PCSError::InvalidParameters(
@@ -375,7 +359,7 @@ where
     }
     quotient.reverse();
     let q_poly = DensePolynomial::from_coefficients_vec(quotient);
-    let commitment: crate::pcs::structs::Commitment<E> = commit(pp, &q_poly)?;
+    let commitment: crate::pcs::structs::Commitment<E> = commit::<E>(pp, &q_poly)?;
     let proof = Proof {
         w: commitment.0,
         random_v: None,

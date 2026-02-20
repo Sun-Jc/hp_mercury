@@ -1,8 +1,8 @@
-use crossbeam_channel::{Receiver, Select, Sender};
+use crossbeam_channel::{Receiver, Sender};
 use lazy_static::lazy_static;
 use log::{debug, error, info, warn};
 use mio::{
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     Events, Interest, Poll, Token,
 };
 use rayon::prelude::*;
@@ -21,7 +21,6 @@ use ark_std::{end_timer, start_timer};
 
 use super::{DeNet, Stats};
 
-#[macro_use]
 lazy_static! {
     static ref CONNECTIONS: RwLock<Connections> = RwLock::new(Connections::default());
     static ref STATS: Mutex<Stats> = Mutex::new(Stats::default());
@@ -42,12 +41,12 @@ macro_rules! get_ch_mut {
 
 #[derive(Debug)]
 struct Peer {
-    id: usize,
+    _id: usize,
     addr: SocketAddr,
 }
 
 thread_local! {
-    static CHANNEL_ID: Cell<usize> = Cell::new(0);
+    static CHANNEL_ID: Cell<usize> = const { Cell::new(0) };
 }
 
 const MAX_NUM_CHANNELS: usize = 3;
@@ -71,13 +70,13 @@ struct Connections {
 impl std::default::Default for Peer {
     fn default() -> Self {
         Self {
-            id: 0,
+            _id: 0,
             addr: "127.0.0.1:8000".parse().unwrap(),
         }
     }
 }
 
-fn parse_buffer(buf: &mut VecDeque<u8>, mut func: impl FnMut(usize, Vec<u8>) -> ()) {
+fn parse_buffer(buf: &mut VecDeque<u8>, mut func: impl FnMut(usize, Vec<u8>)) {
     loop {
         if buf.len() < 9 {
             break;
@@ -179,16 +178,14 @@ fn send_thread(
                                 info!("TCP Stream Write Closed from party 0");
                             }
                         })
+                } else if let Err(e) = streams[0]
+                    .as_ref()
+                    .unwrap()
+                    .shutdown(std::net::Shutdown::Write)
+                {
+                    warn!("Error shutting down stream from party {own_id}: {e}");
                 } else {
-                    if let Err(e) = streams[0]
-                        .as_ref()
-                        .unwrap()
-                        .shutdown(std::net::Shutdown::Write)
-                    {
-                        warn!("Error shutting down stream from party {own_id}: {e}");
-                    } else {
-                        info!("TCP Stream Write Closed from party {own_id}");
-                    }
+                    info!("TCP Stream Write Closed from party {own_id}");
                 }
                 return;
             },
@@ -211,7 +208,7 @@ fn recv_thread(
         let mut peer_buffers = vec![VecDeque::<u8>::new(); streams.len()];
         let mut channel_messages =
             vec![vec![VecDeque::<Vec<u8>>::new(); streams.len()]; MAX_NUM_CHANNELS];
-        let mut num_peers_ready = vec![0usize; MAX_NUM_CHANNELS];
+        let mut num_peers_ready = [0usize; MAX_NUM_CHANNELS];
         let mut peer_closed = vec![false; streams.len()];
         loop {
             poller.poll(&mut events, None).unwrap();
@@ -289,11 +286,11 @@ impl Connections {
         for line in f.lines() {
             let line = line.unwrap();
             let trimmed = line.trim();
-            if trimmed.len() > 0 {
+            if !trimmed.is_empty() {
                 let addr: SocketAddr = trimmed
                     .parse()
                     .unwrap_or_else(|e| panic!("bad socket address: {}:\n{}", trimmed, e));
-                let peer = Peer { id: peer_id, addr };
+                let peer = Peer { _id: peer_id, addr };
                 self.peers.push(peer);
                 peer_id += 1;
             }
@@ -435,7 +432,7 @@ impl Connections {
     }
 
     fn recv_from_master(&self, bytes_out: Option<Vec<Vec<u8>>>) -> Vec<u8> {
-        let timer = start_timer!(|| format!("From master"));
+        let timer = start_timer!(|| "From master".to_string());
 
         let channel_id = CHANNEL_ID.get();
 
@@ -472,7 +469,7 @@ impl Connections {
     }
 
     fn recv_from_master_uniform(&self, bytes_out: Option<Vec<u8>>) -> Vec<u8> {
-        let timer = start_timer!(|| format!("From master"));
+        let timer = start_timer!(|| "From master".to_string());
 
         let channel_id = CHANNEL_ID.get();
 

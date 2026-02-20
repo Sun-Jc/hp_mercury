@@ -38,13 +38,13 @@ impl<F: PrimeField> EqPolynomial<F> {
     fn evals_serial(r: &[F], ell: usize) -> Vec<F> {
         let mut evals: Vec<F> = vec![F::one(); ell.pow2()];
         let mut size = 1;
-        for j in 0..ell {
+        for r_j in r.iter().take(ell) {
             // in each iteration, we double the size of chis
             size *= 2;
             for i in (0..size).rev().step_by(2) {
                 // copy each element from the prior iteration twice
                 let scalar = evals[i / 2];
-                evals[i] = scalar * r[j];
+                evals[i] = scalar * r_j;
                 evals[i - 1] = scalar - evals[i];
             }
         }
@@ -93,13 +93,13 @@ impl<F: PrimeField> EqPolynomial<F> {
         let mut evals: Vec<F> = vec![F::one(); ell.pow2()];
         evals[0] = *coeff;
         let mut size = 1;
-        for j in 0..ell {
+        for r_j in r.iter().take(ell) {
             // in each iteration, we double the size of chis
             size *= 2;
             for i in (0..size).rev().step_by(2) {
                 // copy each element from the prior iteration twice
                 let scalar = evals[i / 2];
-                evals[i] = scalar * r[j];
+                evals[i] = scalar * r_j;
                 evals[i - 1] = scalar - evals[i];
             }
         }

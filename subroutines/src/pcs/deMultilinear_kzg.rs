@@ -16,7 +16,7 @@ use crate::pcs::{
     prelude::{Commitment, PCSError},
     PolynomialCommitmentScheme,
 };
-use arithmetic::{math::Math, DenseMultilinearExtension};
+use arithmetic::DenseMultilinearExtension;
 use ark_ec::{pairing::Pairing, scalar_mul::variable_base::VariableBaseMSM, CurveGroup};
 use ark_poly::MultilinearExtension;
 use ark_std::{sync::Arc, vec::Vec};

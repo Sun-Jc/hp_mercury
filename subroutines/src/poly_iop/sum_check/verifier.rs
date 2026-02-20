@@ -27,15 +27,14 @@ impl<F: PrimeField> SumCheckVerifier<F> for IOPVerifierState<F> {
 
     /// Initialize the verifier's state.
     fn verifier_init(index_info: &Self::VPAuxInfo) -> Self {
-        let res = Self {
+        Self {
             round: 1,
             num_vars: index_info.num_variables,
             max_degree: index_info.max_degree,
             finished: false,
             polynomials_received: Vec::with_capacity(index_info.num_variables),
             challenges: Vec::with_capacity(index_info.num_variables),
-        };
-        res
+        }
     }
 
     /// Run verifier for the current round, given a prover message.

@@ -1,4 +1,5 @@
 #![feature(tcp_linger)]
+#![allow(non_snake_case)]
 
 pub mod multi;
 pub mod two;
@@ -9,25 +10,13 @@ pub use two::DeTwoNet;
 pub mod channel;
 pub use channel::DeSerNet;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Stats {
     pub bytes_sent: usize,
     pub bytes_recv: usize,
     pub broadcasts: usize,
     pub to_master: usize,
     pub from_master: usize,
-}
-
-impl std::default::Default for Stats {
-    fn default() -> Self {
-        Self {
-            bytes_sent: 0,
-            bytes_recv: 0,
-            broadcasts: 0,
-            to_master: 0,
-            from_master: 0,
-        }
-    }
 }
 
 pub trait DeNet {
@@ -75,5 +64,5 @@ pub trait DeNet {
         Self::recv_bytes_from_master(master_response)
     }
 
-    fn set_channel_id(channel_id: usize) {}
+    fn set_channel_id(_channel_id: usize) {}
 }

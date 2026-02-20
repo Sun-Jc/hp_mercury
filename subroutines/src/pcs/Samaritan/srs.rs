@@ -95,7 +95,7 @@ impl<E: Pairing> StructuredReferenceString<E> for SamaritanUniversalParams<E> {
     /// WARNING: THIS FUNCTION IS FOR TESTING PURPOSE ONLY.
     /// THE OUTPUT SRS SHOULD NOT BE USED IN PRODUCTION.
     fn gen_srs_for_testing<R: Rng>(rng: &mut R, max_degree: usize) -> Result<Self, PCSError> {
-        /// isomorphic univariate degree = 1 << num_var;
+        // isomorphic univariate degree = 1 << num_var;
         let max_degree = 1 << max_degree;
         let beta = E::ScalarField::rand(rng);
         let g = E::G1::rand(rng);

@@ -25,6 +25,7 @@ use ark_std::time::Instant;
 
 #[cfg(feature = "distributed")]
 use deNetwork::{DeNet, channel::DeSerNet};
+use tracing::instrument;
 
 mod prover;
 mod verifier;
@@ -1090,6 +1091,7 @@ impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
     ///
     /// Ported from HyperPianist: .agent/HyperPianist/subroutines/src/poly_iop/sum_check/mod.rs
     #[cfg(feature = "distributed")]
+    #[instrument(level = "debug", skip_all, name = "d_prove")]
     fn d_prove<Net: DeSerNet>(
         poly: &Self::VirtualPolynomial,
         mut transcript: Option<&mut Self::Transcript>,

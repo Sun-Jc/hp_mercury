@@ -25,7 +25,7 @@ use subroutines::poly_iop::sum_check::{
 };
 use subroutines::{barycentric_weights, extrapolate, IOPProof};
 use transcript::IOPTranscript;
-use tracing::{debug, info};
+use tracing::{debug, info, instrument};
 
 #[cfg(feature = "parallel")]
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator};
@@ -58,6 +58,7 @@ pub type Result<T> = std::result::Result<T, DeSnarkError>;
 /// # Returns
 /// * `SumCheckInstance` - This party's folded polynomial + partial v
 /// * `SumFoldProof` - This party's partial proof (for `merge_and_verify_sumfold`)
+#[instrument(level = "debug", skip_all, name = "d_sumfold")]
 pub fn d_sumfold<F: PrimeField, N: DeSerNet>(
     polys: Vec<VirtualPolynomial<F>>,
     sums: Vec<F>,

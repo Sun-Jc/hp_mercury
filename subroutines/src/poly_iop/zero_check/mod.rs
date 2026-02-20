@@ -78,9 +78,7 @@ impl<F: PrimeField> ZeroCheck<F> for PolyIOP<F> {
         let length = poly.aux_info.num_variables;
         let r = transcript.get_and_append_challenge_vectors(b"0check r", length)?;
         let f_hat = poly.build_f_hat(r.as_ref())?;
-        let res = <Self as SumCheck<F>>::prove(&f_hat, transcript);
-
-        res
+        <Self as SumCheck<F>>::prove(&f_hat, transcript)
     }
 
     fn mul_prove(

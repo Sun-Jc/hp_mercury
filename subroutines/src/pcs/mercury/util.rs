@@ -1,6 +1,4 @@
-#![feature(isqrt)]
-use ark_ec::pairing::Pairing;
-use ark_ff::{ One, Zero};
+
 
 use ark_std::ops::{Mul, Sub};
 use ark_poly::{univariate::DensePolynomial, DenseUVPolynomial, domain::{EvaluationDomain, Radix2EvaluationDomain}};
@@ -33,10 +31,10 @@ fn eq<F: Field>(i: usize, u: &[F], s: usize) -> F {
 /// input: poly: f(X) , u1: u = ( u1 , u2 )
 pub fn partial_sum<F: Field>(
     poly: &DensePolynomial<F>,
-    u1: &Vec<F>,
+    u1: &[F],
 ) -> DensePolynomial<F> {
     let n = poly.degree() + 1;
-    let mut b = n.isqrt(); // 计算 b = sqrt(n)
+    let b = n.isqrt(); // 计算 b = sqrt(n)
     let t = b.ilog2() as usize;
     // println!("n:{:?}", n);
     // println!("n:{:?}", b);
@@ -170,12 +168,11 @@ pub fn compute_s<F: PrimeField>(
     gamma: F,
     b: usize,
 ) -> DensePolynomial<F> {
-    let pu1 = pu_poly(&u1);
-    let pu2 = pu_poly(&u2);
-    let s1 = compute_partial_s(&g,&pu1,b);
-    let s2 = compute_partial_s(&h,&pu2,b);
-    let s_poly = s1 + &s2 * gamma;
-    s_poly
+    let pu1 = pu_poly(u1);
+    let pu2 = pu_poly(u2);
+    let s1 = compute_partial_s(g,&pu1,b);
+    let s2 = compute_partial_s(h,&pu2,b);
+    s1 + &s2 * gamma
 }
 
 /// 各部分 S(X) 的计算
@@ -238,8 +235,7 @@ pub fn compute_big_h<F: PrimeField>(
     // 除以 X - z：多项式除法
     let denominator = DensePolynomial::from_coefficients_vec(vec![-z, F::one()]); // X - z
 
-    let quotient = &numerator / &denominator; // 使用多项式除法
-    quotient
+    &numerator / &denominator // 使用多项式除法
 }
 
 
@@ -289,9 +285,9 @@ fn lagrange_interpolation<F: Field>(points: &[F], values: &[F]) -> Vec<F> {
         // 计算 d_i 的逆元
         let d_inv = d_i.inverse().expect("Denominator should be nonzero");
         // Lagrange 基多项式 L_i(X) = d_inv * N_i(X)
-        let L_i: Vec<F> = numerator_poly.iter().map(|c| *c * d_inv).collect();
+        let l_i: Vec<F> = numerator_poly.iter().map(|c| *c * d_inv).collect();
         // 将 v_i * L_i(X) 累加到结果中
-        let mut term = L_i.iter().map(|c| *c * values[i]).collect::<Vec<F>>();
+        let term = l_i.iter().map(|c| *c * values[i]).collect::<Vec<F>>();
         result = poly_add(&result, &term);
     }
     result
@@ -366,8 +362,7 @@ pub fn compute_batch_w<F: PrimeField>(
     t: Vec<F>,
 ) -> DensePolynomial<F>{
     let z_t = compute_zs(&t);
-    let poly = &f / &z_t;
-    poly
+    &f / &z_t
 }
 
 pub fn compute_batch_l<F: Field>(
@@ -403,10 +398,10 @@ pub fn compute_batch_w_hat<F: Field>(
     z: F,
 ) -> DensePolynomial<F> {
     let poly = DensePolynomial::from_coefficients_vec(vec![-z, F::one()]);
-    let w_poly = &l / &poly;
-    w_poly
+    &l / &poly
 }
 
+#[allow(dead_code)]
 pub fn multilinear_eval<F: Field>(f: &[F], u: &[F], s: usize) -> F {
     let mut result = F::zero();
     let n = 1 << s; // n = 2^s

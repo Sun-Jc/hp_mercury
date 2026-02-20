@@ -10,7 +10,7 @@ use crate::poly_iop::errors::PolyIOPErrors;
 use arithmetic::identity_permutation_mles;
 use ark_ff::PrimeField;
 use ark_poly::DenseMultilinearExtension;
-use ark_std::{end_timer, start_timer};
+
 use std::sync::Arc;
 
 /// Returns the evaluations of two list of MLEs:

@@ -11,7 +11,6 @@ use ark_std::{end_timer, start_timer};
 
 use super::{DeNet, Stats};
 
-#[macro_use]
 lazy_static! {
     pub static ref CH: Mutex<FieldChannel> = Mutex::new(FieldChannel::default());
 }
@@ -52,7 +51,7 @@ impl FieldChannel {
         for line in f.lines() {
             let line = line.unwrap();
             let trimmed = line.trim();
-            if trimmed.len() > 0 {
+            if !trimmed.is_empty() {
                 let addr: SocketAddr = trimmed
                     .parse()
                     .unwrap_or_else(|e| panic!("bad socket address: {}:\n{}", trimmed, e));
@@ -147,9 +146,7 @@ impl FieldChannel {
                         let _e = s.flush();
                     },
                     Err(e) => {
-                        if e.kind() == std::io::ErrorKind::WouldBlock {
-                        } else if e.kind() == std::io::ErrorKind::Interrupted {
-                        } else {
+                        if !matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) {
                             return Err(e);
                         }
                     },
@@ -161,9 +158,7 @@ impl FieldChannel {
                         bytes_in_offset += read;
                     },
                     Err(e) => {
-                        if e.kind() == std::io::ErrorKind::WouldBlock {
-                        } else if e.kind() == std::io::ErrorKind::Interrupted {
-                        } else {
+                        if !matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) {
                             return Err(e);
                         }
                     },

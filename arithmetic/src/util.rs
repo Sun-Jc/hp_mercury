@@ -91,6 +91,7 @@ pub fn unsafe_allocate_zero_vec<F: PrimeField + Sized>(size: usize) -> Vec<F> {
     result
 }
 
+#[allow(dead_code)]
 pub fn products_except_self<F: PrimeField>(x: &[F]) -> Vec<F> {
     let mut products = vec![F::one(); x.len()];
     for i in 1..products.len() {

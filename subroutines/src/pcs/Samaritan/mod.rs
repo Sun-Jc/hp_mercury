@@ -240,15 +240,10 @@ where
         })
     }
 
-    /// Verifies that `value` is the evaluation at `x` of the polynomial
-    /// committed inside `comm`.
-    ///
-    /// This function takes
-    /// - num_var number of pairing product.
-    /// - num_var number of MSM
-
     /// Verifies that `value_i` is the evaluation at `x_i` of the polynomial
     /// `poly_i` committed inside `comm`.
+    ///
+    /// - num_var number of MSM
     fn batch_verify(
         verifier_param: &Self::VerifierParam,
         commitments: &[Self::Commitment],
@@ -352,7 +347,7 @@ where
     let mut evaluations = Vec::new();
     let mut proofs: Vec<ark_poly_commit::kzg10::Proof<E>> = Vec::new();
 
-    let g_hat = generate_ghat(&f_hat_coeffs, miu);
+    let g_hat = generate_ghat(f_hat_coeffs, miu);
 
     let q_poly = compute_q(&g_hat, l);
     let z_x = &z[z.len() - k..];
@@ -456,19 +451,19 @@ where
     let delta_inv = delta.inverse().unwrap();
 
     let f_hat = DensePolynomial::from_coefficients_vec(f_hat_coeffs.to_vec());
-    let (f_delta, proof_fdelta) = kzg_prove(&pp, &f_hat, delta)?;
+    let (f_delta, proof_fdelta) = kzg_prove(pp, &f_hat, delta)?;
     proofs.push(proof_fdelta);
 
-    let (p_delta, proof_pdelta) = kzg_prove(&pp, &p_hat, delta)?;
+    let (p_delta, proof_pdelta) = kzg_prove(pp, &p_hat, delta)?;
     proofs.push(proof_pdelta);
 
-    let (h_delta, proof_hdelta) = kzg_prove(&pp, &h_hat, delta)?;
+    let (h_delta, proof_hdelta) = kzg_prove(pp, &h_hat, delta)?;
     proofs.push(proof_hdelta);
 
-    let (v_delta, proof_vdelta) = kzg_prove(&pp, &v_hat, delta)?;
+    let (v_delta, proof_vdelta) = kzg_prove(pp, &v_hat, delta)?;
     proofs.push(proof_vdelta);
 
-    let (a_delta, proof_adelta) = kzg_prove(&pp, &a_hat, delta)?;
+    let (a_delta, proof_adelta) = kzg_prove(pp, &a_hat, delta)?;
     proofs.push(proof_adelta);
 
     let (t_delta_inv, proof_tdelta_inv) = kzg_prove(pp, &t_poly, delta_inv)?;
@@ -605,12 +600,12 @@ where
         })?;
 
     let vk = VerifierKey {
-        g: verifier_param.g.clone(),
-        gamma_g: verifier_param.g.clone(),
-        h: verifier_param.h.clone(),
-        beta_h: verifier_param.beta_h.clone(),
-        prepared_h: E::G2Prepared::from(verifier_param.h.clone()),
-        prepared_beta_h: E::G2Prepared::from(verifier_param.beta_h.clone()),
+        g: verifier_param.g,
+        gamma_g: verifier_param.g,
+        h: verifier_param.h,
+        beta_h: verifier_param.beta_h,
+        prepared_h: E::G2Prepared::from(verifier_param.h),
+        prepared_beta_h: E::G2Prepared::from(verifier_param.beta_h),
     };
 
     let mut rng = ChaCha8Rng::from_seed([0u8; 32]);
@@ -624,8 +619,6 @@ where
         &mut rng,
     )
     .map_err(|e| PCSError::InvalidProof(format!("KZG batch check failed: {:?}", e)))?;
-
-    let result = batch_result;
 
 
     let mu = z.len();
@@ -646,11 +639,7 @@ where
 
     // println!("b_verify{:?}", b_delta);
     let rhs = delta_m1 * p_delta + beta * delta_m2 * u_delta + beta * beta * delta_l2 * b_delta;
-    let mut res = false;
-
-    if t_delta_inv == rhs {
-        res = true;
-    }
+    let res = t_delta_inv == rhs;
     Ok(res)
 }
 
