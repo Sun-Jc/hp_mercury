@@ -51,6 +51,10 @@ pub struct Config {
     pub gate_type: GateType,
     /// κ (kappa) - log of number of parties
     pub log_num_parties: usize,
+    /// Optional path for SRS file cache.
+    /// If set, SRS is loaded from this file when it exists and is large enough;
+    /// otherwise generated and saved here.
+    pub srs_path: Option<String>,
 }
 
 impl Config {
@@ -66,6 +70,7 @@ impl Config {
             log_num_constraints,
             gate_type,
             log_num_parties,
+            srs_path: None,
         }
     }
 
@@ -176,13 +181,21 @@ impl<F: PrimeField> SumCheckInstance<F> {
 
 /// Proof for the distributed SNARK.
 ///
-/// Currently contains only the distributed SumCheck proof (from `d_prove`).
-/// PCS commitments and opening proofs will be added when the full
-/// HyperPianist pipeline is implemented.
-#[derive(Clone, Debug, CanonicalSerialize, CanonicalDeserialize)]
+/// Contains a single combined SumCheck proof whose rounds are:
+///   sumfold rounds (log₂(M)) ++ HyperPianist rounds (num_vars + log₂(K))
+/// plus the SumFold metadata needed for verification.
+#[derive(Clone, Debug)]
 pub struct Proof<F: PrimeField> {
-    /// Distributed SumCheck proof over the folded instance
-    pub sumcheck_proof: IOPProof<F>,
+    /// Combined SumCheck proof: sumfold rounds ++ HyperPianist rounds
+    pub proof: IOPProof<F>,
+    /// Number of sumfold rounds (= log₂(M)), for splitting during verification
+    pub num_sumfold_rounds: usize,
+    /// Weighted sum: sum_t = Σᵢ eq(ρ, i) · sᵢ
+    pub sum_t: F,
+    /// Aux info for the folding SumCheck (max_degree, num_variables = log₂(m))
+    pub q_aux_info: VPAuxInfo<F>,
+    /// Claimed sum of the folded polynomial
+    pub v: F,
     // TODO: Add PCS commitments and opening proofs
 }
 

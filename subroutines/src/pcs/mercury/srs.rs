@@ -80,6 +80,13 @@ impl<E: Pairing> StructuredReferenceString<E> for MercuryUniversalParams<E> {
         &self,
         supported_size: usize,
     ) -> Result<(Self::ProverParam, Self::VerifierParam), PCSError> {
+        if supported_size >= self.powers_of_g.len() {
+            return Err(PCSError::InvalidParameters(format!(
+                "SRS too small: need degree {}, have {}",
+                supported_size,
+                self.powers_of_g.len() - 1
+            )));
+        }
         let powers_of_g = self.powers_of_g[..=supported_size].to_vec();
 
         let pk = Self::ProverParam { powers_of_g };

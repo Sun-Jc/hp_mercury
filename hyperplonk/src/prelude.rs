@@ -10,7 +10,7 @@ pub use crate::{
     mock::MockCircuit,
     selectors::SelectorColumn,
     structs::{HyperPlonkIndex, HyperPlonkParams, HyperPlonkProvingKey, HyperPlonkVerifyingKey},
-    utils::build_f,
+    utils::{build_f, eval_f},
     witness::WitnessColumn,
     HyperPlonkSNARK,
 };

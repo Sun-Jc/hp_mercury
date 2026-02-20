@@ -229,7 +229,7 @@ pub fn build_f<F: PrimeField>(
     Ok(res)
 }
 
-pub(crate) fn eval_f<F: PrimeField>(
+pub fn eval_f<F: PrimeField>(
     gates: &CustomizedGates,
     selector_evals: &[F],
     witness_evals: &[F],

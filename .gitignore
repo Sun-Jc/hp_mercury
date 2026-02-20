@@ -302,3 +302,5 @@ TSWLatexianTemp*
 *.txt
 
 .beads
+
+*.params

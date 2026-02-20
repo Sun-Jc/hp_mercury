@@ -108,7 +108,7 @@ pub trait SumCheck<F: PrimeField> {
     #[cfg(feature = "distributed")]
     fn d_prove<Net: DeSerNet>(
         poly: &Self::VirtualPolynomial,
-        transcript: &mut Self::Transcript,
+        transcript: Option<&mut Self::Transcript>,
     ) -> Result<Option<Self::SumCheckProof>, PolyIOPErrors>;
 }
 
@@ -1092,15 +1092,16 @@ impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
     #[cfg(feature = "distributed")]
     fn d_prove<Net: DeSerNet>(
         poly: &Self::VirtualPolynomial,
-        transcript: &mut Self::Transcript,
+        mut transcript: Option<&mut Self::Transcript>,
     ) -> Result<Option<Self::SumCheckProof>, PolyIOPErrors> {
         let num_party_vars = log2(Net::n_parties()) as usize;
 
         // Only master appends aux_info (with extended num_variables) to transcript
         if Net::am_master() {
+            let tr = transcript.as_deref_mut().expect("master must have transcript");
             let mut aux_info = poly.aux_info.clone();
             aux_info.num_variables += num_party_vars;
-            transcript.append_serializable_element(b"aux info", &aux_info)?;
+            tr.append_serializable_element(b"aux info", &aux_info)?;
         }
 
         let num_vars = poly.aux_info.num_variables;
@@ -1133,14 +1134,16 @@ impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
                             .collect(),
                     },
                 );
-                transcript.append_serializable_element(b"prover msg", &prover_msg)?;
+                let tr = transcript.as_deref_mut().unwrap();
+                tr.append_serializable_element(b"prover msg", &prover_msg)?;
             }
             prover_msgs.push(prover_msg);
 
             // Master generates challenge and broadcasts to all parties
             if Net::am_master() {
+                let tr = transcript.as_deref_mut().unwrap();
                 let challenge_value =
-                    transcript.get_and_append_challenge(b"Internal round")?;
+                    tr.get_and_append_challenge(b"Internal round")?;
                 Net::recv_from_master_uniform(Some(challenge_value));
                 challenge = Some(challenge_value);
             } else {
@@ -1183,6 +1186,8 @@ impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
         phase2_poly.replace_mles(new_mles);
 
         // Run Phase 2: standard local sumcheck on the tiny polynomial
+        // After worker early return, master can unwrap the transcript
+        let transcript = transcript.expect("master must have transcript");
         let mut old_challenges = prover_state.challenges.clone();
         let num_vars_phase2 = phase2_poly.aux_info.num_variables;
         let mut prover_state_phase2 = IOPProverState::prover_init(&phase2_poly)?;
@@ -1216,7 +1221,7 @@ impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Stage 2: Compute sum_t = Σᵢ eq(rho, i) * sums[i]
-fn stage2_compute_sum_t<F: PrimeField>(sums: &[F], eq_xr_vec: &[F]) -> F {
+pub fn stage2_compute_sum_t<F: PrimeField>(sums: &[F], eq_xr_vec: &[F]) -> F {
     sums.iter()
         .zip(eq_xr_vec.iter())
         .map(|(s, eq)| *s * *eq)
@@ -1235,7 +1240,7 @@ fn stage2_compute_sum_t<F: PrimeField>(sums: &[F], eq_xr_vec: &[F]) -> F {
 ///
 /// So we iterate: for s in 0..num_splits, for x' in 0..chunk_size, for i in 0..m
 /// This produces k = s * chunk_size + x' in correct order.
-fn stage3_merge_split_mles<F: PrimeField>(
+pub fn stage3_merge_split_mles<F: PrimeField>(
     all_splits: &[Vec<VirtualPolynomial<F>>],
     m: usize,
     t: usize,
@@ -1270,7 +1275,7 @@ fn stage3_merge_split_mles<F: PrimeField>(
 }
 
 /// Stage 4: Build composed VirtualPolynomial from merged MLEs
-fn stage4_compose_poly<F: PrimeField>(
+pub fn stage4_compose_poly<F: PrimeField>(
     merged_mles: Vec<Arc<DenseMultilinearExtension<F>>>,
     products: Vec<(F, Vec<usize>)>,
     max_degree: usize,

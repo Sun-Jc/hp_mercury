@@ -1,5 +1,6 @@
 //! deSnark - Distributed SNARK protocol implementation
 
+pub mod d_sumfold;
 pub mod errors;
 pub mod snark;
 pub mod structs;

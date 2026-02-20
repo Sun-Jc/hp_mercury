@@ -68,7 +68,7 @@ fn main() {
         Ok((_vk, proof)) => {
             let role = if proof.is_some() { "master (has proof)" } else { "worker" };
             info!(
-                "[Party {}] dist_prove completed as {} in {:?}",
+                "✅ [Party {}] dist_prove completed as {} in {:?}",
                 party_id,
                 role,
                 start.elapsed()
@@ -76,7 +76,7 @@ fn main() {
         }
         Err(e) => {
             error!(
-                "[Party {}] dist_prove failed: {} (elapsed {:?})",
+                "❌[Party {}] dist_prove failed: {} (elapsed {:?})",
                 party_id,
                 e,
                 start.elapsed()
@@ -86,7 +86,7 @@ fn main() {
 
     // Deinitialize network after dist_prove
     Net::deinit();
-    info!("[Party {}] Exited successfully", party_id);
+    info!("✅ [Party {}] Exited successfully", party_id);
 }
 
 fn parse_args(args: &[String]) -> (usize, String) {

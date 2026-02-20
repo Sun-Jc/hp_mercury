@@ -15,7 +15,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 HOSTS_FILE="$PROJECT_ROOT/deSnark/examples/hosts_4.txt"
-CONFIG_FILE="$PROJECT_ROOT/deSnark/examples/demo_config.toml"
+CONFIG_FILE="${DESNARK_CONFIG:-$PROJECT_ROOT/deSnark/examples/demo_config.toml}"
 BINARY="$PROJECT_ROOT/target/release/examples/dist_prove_demo"
 LOG_DIR="$PROJECT_ROOT/target/desnark_demo_logs"
 
@@ -33,10 +33,9 @@ print_header() {
 }
 
 do_build() {
-    echo -e "${YELLOW}Building dist_prove_demo (release + debug_assertions)...${NC}"
+    echo -e "${YELLOW}Building dist_prove_demo (release)...${NC}"
     cd "$PROJECT_ROOT"
-    CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true \
-        cargo build --example dist_prove_demo -p deSnark --release
+    cargo build --example dist_prove_demo -p deSnark --release
     echo -e "${GREEN}Build complete: $BINARY${NC}"
 }
 

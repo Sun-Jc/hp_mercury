@@ -5,23 +5,23 @@ use crate::structs::{
     Config, HyperPlonkProvingKey, HyperPlonkVerifyingKey, MockCircuit, Proof, SumCheckInstance,
     SumFoldProof,
 };
-use arithmetic::eq_poly::EqPolynomial;
+use arithmetic::{build_eq_x_r_vec, eq_poly::EqPolynomial, VPAuxInfo, VirtualPolynomial};
 use ark_ec::pairing::Pairing;
 use ark_ff::PrimeField;
-use ark_poly::DenseMultilinearExtension;
+use ark_poly::{DenseMultilinearExtension, MultilinearExtension};
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::Rng;
 use ark_std::test_rng;
 use deNetwork::{DeMultiNet as Net, DeNet, DeSerNet};
-use hyperplonk::prelude::build_f;
+use hyperplonk::prelude::{build_f, eval_f};
 use hyperplonk::HyperPlonkSNARK;
-use tracing::{debug, info, instrument};
 use std::sync::Arc;
 use ark_std::time::Instant;
-use subroutines::poly_iop::prelude::SumCheck;
-use subroutines::poly_iop::sum_check::verify_sum_fold;
 use subroutines::pcs::PolynomialCommitmentScheme;
-use subroutines::poly_iop::prelude::PolyIOP;
+use subroutines::poly_iop::prelude::{PolyIOP, SumCheck};
+use subroutines::poly_iop::sum_check::verify_sum_fold;
 use subroutines::{BatchProof, Commitment, IOPProof};
+use tracing::{debug, info, instrument, warn};
 use transcript::IOPTranscript;
 
 /// Result type for deSnark operations.
@@ -40,6 +40,7 @@ pub trait HyperPlonkPCS<E: Pairing>:
         Evaluation = E::ScalarField,
         Commitment = Commitment<E>,
         BatchProof = BatchProof<E, Self>,
+        SRS: CanonicalSerialize + CanonicalDeserialize,
     > + Sized
 {
 }
@@ -54,36 +55,108 @@ where
         Evaluation = E::ScalarField,
         Commitment = Commitment<E>,
         BatchProof = BatchProof<E, PCS>,
+        SRS: CanonicalSerialize + CanonicalDeserialize,
     >,
 {
 }
 
-/// Phase 0: Generate SRS from config.
+/// Phase 0: Generate or load SRS from config.
+///
+/// If `config.srs_path` is set:
+/// - Tries to load SRS from file, validates it is large enough via `PCS::trim`
+/// - If file missing or SRS too small, generates a new SRS and saves it
+///
+/// If `config.srs_path` is `None`, generates SRS without caching.
 ///
 /// The SRS log-size is `log_num_constraints - log_num_parties`,
 /// matching the per-partition constraint count.
 ///
 /// WARNING: Uses `test_rng()` — for testing only, not production.
-///
-/// # Arguments
-/// * `config` - Protocol configuration
-///
-/// # Returns
-/// * `PCS::SRS` - Structured Reference String for the PCS
 #[instrument(level = "debug", skip_all, name = "setup")]
 pub fn setup<E: Pairing, PCS: HyperPlonkPCS<E>>(
     config: &Config,
 ) -> Result<PCS::SRS> {
     let supported_log_size = config.log_num_constraints - config.log_num_parties;
     info!(
-        "SRS generation: log_size = {} (log_constraints = {}, log_parties = {})",
+        "SRS setup: log_size = {} (log_constraints = {}, log_parties = {})",
         supported_log_size, config.log_num_constraints, config.log_num_parties
     );
+
+    // Try loading from cache file
+    if let Some(ref path) = config.srs_path {
+        if let Some(srs) = try_load_srs::<E, PCS>(path, supported_log_size) {
+            return Ok(srs);
+        }
+    }
+
+    // Generate fresh SRS
     let mut rng = test_rng();
     let srs = PCS::gen_srs_for_testing(&mut rng, supported_log_size)
         .map_err(|e| DeSnarkError::InvalidParameters(format!("SRS generation failed: {e}")))?;
-    info!("SRS generated successfully");
+    info!("✅ SRS generated successfully");
+
+    // Save to cache file
+    if let Some(ref path) = config.srs_path {
+        save_srs::<E, PCS>(&srs, path);
+    }
+
     Ok(srs)
+}
+
+/// Try to load SRS from file and validate it is large enough.
+/// Returns `None` if file doesn't exist, deserialization fails, or SRS is too small.
+fn try_load_srs<E: Pairing, PCS: HyperPlonkPCS<E>>(
+    path: &str,
+    supported_log_size: usize,
+) -> Option<PCS::SRS> {
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            info!("SRS cache miss ({}): {}", path, e);
+            return None;
+        }
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let srs: PCS::SRS = match CanonicalDeserialize::deserialize_uncompressed_unchecked(&mut reader)
+    {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("SRS cache corrupted ({}): {}", path, e);
+            return None;
+        }
+    };
+
+    // Validate: try trimming to the required size
+    match PCS::trim(&srs, None, Some(supported_log_size)) {
+        Ok(_) => {
+            info!("✅ SRS loaded from cache ({})", path);
+            Some(srs)
+        }
+        Err(e) => {
+            warn!(
+                "SRS cache too small ({}, need log_size={}): {}",
+                path, supported_log_size, e
+            );
+            None
+        }
+    }
+}
+
+/// Save SRS to file. Logs a warning on failure but does not propagate the error.
+fn save_srs<E: Pairing, PCS: HyperPlonkPCS<E>>(srs: &PCS::SRS, path: &str) {
+    match std::fs::File::create(path) {
+        Ok(file) => {
+            let mut writer = std::io::BufWriter::new(file);
+            if let Err(e) = srs.serialize_uncompressed(&mut writer) {
+                warn!("Failed to write SRS cache ({}): {}", path, e);
+            } else {
+                info!("✅ SRS cached to {}", path);
+            }
+        }
+        Err(e) => {
+            warn!("Failed to create SRS cache file ({}): {}", path, e);
+        }
+    }
 }
 
 /// Phase 1: Generate circuit, keys, and mock circuits.
@@ -331,7 +404,7 @@ pub fn prove_sumfold<F: PrimeField>(
         }
 
         info!(
-            "All 3 versions match! sum_t={:?}, v={:?}",
+            "✅ All 3 versions match! sum_t={:?}, v={:?}",
             sum_t_v1, v_v1
         );
         info!(
@@ -458,7 +531,7 @@ pub fn merge_and_verify_sumfold<F: PrimeField>(
     }
 
     info!(
-        "Combined proof verified: v_total={:?}, {} rounds",
+        "✅ Combined proof verified: v_total={:?}, {} rounds",
         v_total, num_rounds
     );
 
@@ -477,12 +550,12 @@ pub fn merge_and_verify_sumfold<F: PrimeField>(
 /// * `transcript` - Fiat-Shamir transcript (carries SumFold state)
 ///
 /// # Returns
-/// * `Option<Proof>` - `Some` on master, `None` on workers
+/// * `Option<IOPProof>` - `Some` on master, `None` on workers
 pub fn prove_hyper_pianist<E: Pairing, PCS: HyperPlonkPCS<E>>(
     _pk: &ProvingKey<E, PCS>,
     instance: &SumCheckInstance<E::ScalarField>,
-    transcript: &mut IOPTranscript<E::ScalarField>,
-) -> Result<Option<Proof<E::ScalarField>>> {
+    transcript: Option<&mut IOPTranscript<E::ScalarField>>,
+) -> Result<Option<IOPProof<E::ScalarField>>> {
     // Run distributed SumCheck on the folded instance
     let sumcheck_proof =
         <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::d_prove::<Net>(
@@ -495,12 +568,12 @@ pub fn prove_hyper_pianist<E: Pairing, PCS: HyperPlonkPCS<E>>(
     match sumcheck_proof {
         Some(sumcheck_proof) => {
             info!(
-                "d_prove complete: {} rounds, point dimension = {}",
+                "✅ d_prove complete: {} rounds, point dimension = {}",
                 sumcheck_proof.proofs.len(),
                 sumcheck_proof.point.len()
             );
             // TODO: PCS opening phase (accumulate polys, evaluate, d_multi_open)
-            Ok(Some(Proof { sumcheck_proof }))
+            Ok(Some(sumcheck_proof))
         }
         None => Ok(None),
     }
@@ -557,11 +630,89 @@ pub fn verify_network() -> Result<()> {
         }
     }
 
-    info!("[Party {}] Network verification passed", party_id);
+    info!("✅ [Party {}] Network verification passed", party_id);
     Ok(())
 }
 
+/// Inner distributed proving pipeline - circuit-agnostic.
+///
+/// Takes M virtual polynomials and their claimed sums, then runs:
+/// 1. Distributed SumFold to aggregate M instances into one
+/// 2. Distributed SumCheck (HyperPianist) on the folded instance
+/// 3. Assembles the combined proof
+///
+/// This layer depends only on the field `F` — no circuit, pairing, or PCS
+/// knowledge is required. The network must already be initialized.
+///
+/// # Arguments
+/// * `polys` - M virtual polynomials (one per instance)
+/// * `sums`  - M claimed sums (one per instance)
+///
+/// # Returns
+/// * `Option<Proof>` - Combined proof (`Some` on master, `None` on workers)
+#[instrument(level = "debug", skip_all, name = "dist_prove_sumcheck")]
+pub fn dist_prove_sumcheck<F: PrimeField>(
+    polys: Vec<VirtualPolynomial<F>>,
+    sums: Vec<F>,
+) -> Result<Option<Proof<F>>> {
+    // Create a single transcript threaded through all proving phases.
+    // Master holds the transcript; workers receive challenges via network.
+    let mut transcript = <PolyIOP<F> as SumCheck<F>>::init_transcript();
+
+    // Phase 2: Distributed SumFold aggregation
+    let transcript_opt = if Net::am_master() {
+        Some(&mut transcript)
+    } else {
+        None
+    };
+    let (folded_instance, sumfold_proof) =
+        crate::d_sumfold::d_sumfold::<F, Net>(polys, sums, transcript_opt)?;
+
+    #[cfg(debug_assertions)]
+    if Net::am_master() {
+        let v_total = merge_and_verify_sumfold(vec![sumfold_proof.clone()])?;
+        info!("✅ SumFold verify passed: v_total={:?}", v_total);
+    }
+
+    // Phase 3: HyperPianist distributed SumCheck (operates on folded instance)
+    let transcript_opt = if Net::am_master() {
+        Some(&mut transcript)
+    } else {
+        None
+    };
+    let hp_proof = <PolyIOP<F> as SumCheck<F>>::d_prove::<Net>(
+        &folded_instance.poly,
+        transcript_opt,
+    )
+    .map_err(|e| DeSnarkError::HyperPlonkError(format!("d_prove failed: {e}")))?;
+
+    // Concatenate sumfold + HyperPianist into one big proof
+    let num_sumfold_rounds = sumfold_proof.proof.proofs.len();
+    let proof = hp_proof.map(|hp| {
+        let mut combined_point = sumfold_proof.proof.point;
+        combined_point.extend(hp.point);
+        let mut combined_proofs = sumfold_proof.proof.proofs;
+        combined_proofs.extend(hp.proofs);
+        Proof {
+            proof: IOPProof {
+                point: combined_point,
+                proofs: combined_proofs,
+            },
+            num_sumfold_rounds,
+            sum_t: sumfold_proof.sum_t,
+            q_aux_info: sumfold_proof.q_aux_info,
+            v: sumfold_proof.v,
+        }
+    });
+
+    Ok(proof)
+}
+
 /// Distributed SNARK prove - complete end-to-end pipeline.
+///
+/// Outer layer: handles circuit-specific operations (setup, circuit
+/// generation, conversion to SumCheck instances), then delegates to
+/// [`dist_prove_sumcheck`] for the circuit-agnostic distributed proving.
 ///
 /// The network must be initialized (via `Net::init_from_file`) before calling.
 /// The caller is responsible for `Net::deinit()` after this returns.
@@ -571,8 +722,8 @@ pub fn verify_network() -> Result<()> {
 /// 2. setup(config) -> SRS
 /// 3. make_circuit(config, srs) -> (PK, VK, Vec<MockCircuit>)
 /// 4. circuits_to_sumcheck(pk, circuits) -> Vec<SumCheckInstance>
-/// 5. prove_sumfold(instances) -> (folded SumCheckInstance, SumFold Proof)
-/// 6. prove_hyper_pianist(pk, folded_instance) -> Final Proof
+/// 5. dist_prove_sumcheck(polys, sums) -> Proof  (inner layer)
+/// 6. verify_proof_eval(proof, pk, circuits, aux) — master-side eval check
 ///
 /// # Arguments
 /// * `config` - Protocol configuration
@@ -580,6 +731,135 @@ pub fn verify_network() -> Result<()> {
 /// # Returns
 /// * `VerifyingKey` - For verification
 /// * `Option<Proof>` - Final SNARK proof (`Some` on master, `None` on workers)
+
+/// Verify the proof against circuit data (master-side eval check).
+///
+/// Replays the full prover transcript (SumFold → HyperPianist) so that
+/// the verifier derives the same Fiat-Shamir challenges as the prover,
+/// then checks the final subclaim against the circuit polynomials.
+///
+/// Three steps:
+/// 1. Replay SumFold transcript, then verify HyperPianist SumCheck
+/// 2. Fold individual MLE evaluations with eq(r_b, ·) weights
+/// 3. Compute gate on folded evaluations and compare against subclaim
+fn verify_proof_eval<E: Pairing>(
+    proof: &Proof<E::ScalarField>,
+    pk: &ProvingKey<E, impl PolynomialCommitmentScheme<E>>,
+    circuits: &[MockCircuit<E::ScalarField>],
+    instances_aux: &VPAuxInfo<E::ScalarField>,
+) -> Result<()> {
+    let num_vars = instances_aux.num_variables;
+    let total_hp_rounds = proof.proof.proofs.len() - proof.num_sumfold_rounds;
+
+    // ═══════════════════════════════════════════════════════════════
+    // Step 1: Replay full transcript and verify HyperPianist SumCheck
+    //
+    // The prover's transcript was threaded: SumFold → d_prove.
+    // We must replay SumFold operations first so the transcript state
+    // matches, then verify the HyperPianist portion.
+    // ═══════════════════════════════════════════════════════════════
+    let mut transcript =
+        <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::init_transcript();
+
+    // Replay SumFold transcript operations
+    transcript
+        .append_serializable_element(b"aux info", &proof.q_aux_info)
+        .map_err(|e| DeSnarkError::HyperPlonkError(format!("transcript replay: {e}")))?;
+    let _rho: Vec<E::ScalarField> = transcript
+        .get_and_append_challenge_vectors(b"sumfold rho", proof.num_sumfold_rounds)
+        .map_err(|e| DeSnarkError::HyperPlonkError(format!("transcript replay: {e}")))?;
+    for i in 0..proof.num_sumfold_rounds {
+        transcript
+            .append_serializable_element(b"prover msg", &proof.proof.proofs[i])
+            .map_err(|e| {
+                DeSnarkError::HyperPlonkError(format!("transcript replay round {i}: {e}"))
+            })?;
+        transcript
+            .get_and_append_challenge(b"Internal round")
+            .map_err(|e| {
+                DeSnarkError::HyperPlonkError(format!("transcript replay challenge {i}: {e}"))
+            })?;
+    }
+
+    // d_prove uses extended aux_info (num_variables includes party variables)
+    let mut hp_aux_info = instances_aux.clone();
+    hp_aux_info.num_variables = total_hp_rounds;
+
+    let hp_proof = IOPProof {
+        point: proof.proof.point[proof.num_sumfold_rounds..].to_vec(),
+        proofs: proof.proof.proofs[proof.num_sumfold_rounds..].to_vec(),
+    };
+
+    let subclaim =
+        <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::verify(
+            proof.v,
+            &hp_proof,
+            &hp_aux_info,
+            &mut transcript,
+        )
+        .map_err(|e| DeSnarkError::HyperPlonkError(format!(
+            "SumCheck verification of HyperPianist proof failed: {e}"
+        )))?;
+
+    // ═══════════════════════════════════════════════════════════════
+    // Step 2: Evaluate folded polynomial at the challenge point
+    //
+    // The folded polynomial is:
+    //   P(x) = Σ_p coeff_p · Π_{j∈prod_p} [Σ_i eq(r_b,i)·mle_j^i(x)]
+    //
+    // We fold individual MLE evaluations first (with eq(r_b,·) weights),
+    // then compute the gate function on the folded evaluations.
+    // This correctly computes "product of sums" rather than the incorrect
+    // "sum of products" (Σ_i eq·f_i).
+    // ═══════════════════════════════════════════════════════════════
+    let r_b = &proof.proof.point[..proof.num_sumfold_rounds];
+    let r_phase1 = &subclaim.point[..num_vars];
+
+    let eq_rb_vec = build_eq_x_r_vec(r_b)
+        .map_err(|e| DeSnarkError::HyperPlonkError(format!("build_eq_x_r_vec: {e}")))?;
+
+    let gate_func = &pk.params.gate_func;
+    let num_selectors = circuits[0].index.selectors.len();
+    let num_witnesses = circuits[0].witnesses.len();
+
+    // Fold selector and witness evaluations across all M circuits
+    let mut folded_sel_evals = vec![E::ScalarField::from(0u64); num_selectors];
+    let mut folded_wit_evals = vec![E::ScalarField::from(0u64); num_witnesses];
+
+    for (i, circuit) in circuits.iter().enumerate() {
+        let w = eq_rb_vec[i];
+        for (j, sel) in circuit.index.selectors.iter().enumerate() {
+            let mle = DenseMultilinearExtension::from(sel);
+            folded_sel_evals[j] += w * mle.evaluate(r_phase1).unwrap();
+        }
+        for (j, wit) in circuit.witnesses.iter().enumerate() {
+            let mle = DenseMultilinearExtension::from(wit);
+            folded_wit_evals[j] += w * mle.evaluate(r_phase1).unwrap();
+        }
+    }
+
+    let folded_eval = eval_f(gate_func, &folded_sel_evals, &folded_wit_evals)
+        .map_err(|e| DeSnarkError::HyperPlonkError(format!("eval_f: {e}")))?;
+
+    // ═══════════════════════════════════════════════════════════════
+    // Step 3: Check subclaim against folded evaluation
+    //
+    // For identical parties (all share the same circuits), the Phase 2
+    // interpolation is constant, so subclaim.expected_evaluation = P(r_phase1).
+    // ═══════════════════════════════════════════════════════════════
+    if subclaim.expected_evaluation != folded_eval {
+        return Err(DeSnarkError::HyperPlonkError(format!(
+            "Circuit-level eval mismatch: subclaim={:?}, folded_eval={:?}",
+            subclaim.expected_evaluation, folded_eval
+        )));
+    }
+    info!(
+        "✅ Circuit-level eval verification passed: folded_eval={:?}",
+        folded_eval
+    );
+    Ok(())
+}
+
 pub fn dist_prove<E: Pairing, PCS: HyperPlonkPCS<E>>(
     config: &Config,
 ) -> Result<(VerifyingKey<E, PCS>, Option<Proof<E::ScalarField>>)> {
@@ -595,22 +875,21 @@ pub fn dist_prove<E: Pairing, PCS: HyperPlonkPCS<E>>(
     // Phase 1.5: Convert circuits to SumCheck instances
     let instances = circuits_to_sumcheck::<E, PCS>(&pk, &circuits)?;
 
-    // Create a single transcript threaded through all proving phases
-    let mut transcript =
-        <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::init_transcript();
+    // Save aux_info before instances are consumed (needed for verification)
+    let instances_aux = instances[0].aux_info().clone();
 
-    // Phase 2: SumFold aggregation (circuit-agnostic)
-    let (folded_instance, sumfold_proof) = prove_sumfold(instances, &mut transcript)?;
+    let (polys, sums): (Vec<_>, Vec<_>) = instances
+        .into_iter()
+        .map(|inst| (inst.poly, inst.sum))
+        .unzip();
 
-    #[cfg(debug_assertions)]
-    {
-        let v_total = merge_and_verify_sumfold(vec![sumfold_proof.clone()])?;
-        debug!("SumFold verify passed: v_total={:?}", v_total);
+    // Phase 2+3: Circuit-agnostic distributed proving
+    let proof = dist_prove_sumcheck(polys, sums)?;
+
+    // Phase 4 (master only): Verify the proof against circuit data
+    if let Some(ref proof) = proof {
+        verify_proof_eval::<E>(proof, &pk, &circuits, &instances_aux)?;
     }
-    let _ = sumfold_proof;
-
-    // Phase 3: HyperPianist distributed SumCheck (operates on folded instance)
-    let proof = prove_hyper_pianist::<E, PCS>(&pk, &folded_instance, &mut transcript)?;
 
     Ok((vk, proof))
 }
