@@ -6,6 +6,7 @@
 
 //! Prelude
 pub use crate::pcs::{
+    deMultilinear_kzg::DeMkzg,
     errors::PCSError,
     multilinear_kzg::{
         batching::BatchProof,

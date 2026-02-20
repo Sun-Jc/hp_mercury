@@ -42,7 +42,15 @@ impl<F: PrimeField> MockCircuit<F> {
 impl<F: PrimeField> MockCircuit<F> {
     /// Generate a mock plonk circuit for the input constraint size.
     pub fn new(num_constraints: usize, gate: &CustomizedGates) -> MockCircuit<F> {
-        let mut rng = test_rng();
+        Self::new_with_rng(num_constraints, gate, &mut test_rng())
+    }
+
+    /// Generate a mock plonk circuit using the provided RNG.
+    pub fn new_with_rng(
+        num_constraints: usize,
+        gate: &CustomizedGates,
+        rng: &mut impl RngCore,
+    ) -> MockCircuit<F> {
         let nv = log2(num_constraints);
         let num_selectors = gate.num_selector_columns();
         let num_witnesses = gate.num_witness_columns();
@@ -54,9 +62,9 @@ impl<F: PrimeField> MockCircuit<F> {
 
         for _cs_counter in 0..num_constraints {
             let mut cur_selectors: Vec<F> = (0..(num_selectors - 1))
-                .map(|_| F::rand(&mut rng))
+                .map(|_| F::rand(rng))
                 .collect();
-            let cur_witness: Vec<F> = (0..num_witnesses).map(|_| F::rand(&mut rng)).collect();
+            let cur_witness: Vec<F> = (0..num_witnesses).map(|_| F::rand(rng)).collect();
             let mut last_selector = F::zero();
             for (index, (coeff, q, wit)) in gate.gates.iter().enumerate() {
                 if index != num_selectors - 1 {

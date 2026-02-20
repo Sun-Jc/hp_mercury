@@ -23,6 +23,7 @@ transcript = { path = "../transcript" }
 util = { path = "../util" }
 env_logger = "0.11.8"
 log = "0.4"
+tracing = "0.1"
 ark-poly-commit = "0.4.0"
 deNetwork = { path = "../deNetwork", optional = true }
 

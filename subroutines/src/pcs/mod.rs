@@ -9,6 +9,7 @@ mod multilinear_kzg;
 mod structs;
 mod univariate_kzg;
 pub mod Samaritan;
+pub mod deMultilinear_kzg;
 
 pub mod prelude;
 mod mercury;

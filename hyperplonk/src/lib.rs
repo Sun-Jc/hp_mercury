@@ -21,8 +21,8 @@ mod mock;
 pub mod prelude;
 mod selectors;
 mod snark;
-mod structs;
-mod utils;
+pub mod structs;
+pub mod utils;
 mod witness;
 
 /// A trait for HyperPlonk SNARKs.

@@ -179,6 +179,57 @@ impl<F: PrimeField> SumCheckProver<F> for IOPProverState<F> {
     }
 }
 
+impl<F: PrimeField> IOPProverState<F> {
+    /// Bind the final challenge to get the scalar evaluations of all MLEs.
+    ///
+    /// After all sumcheck rounds, each MLE has 1 variable left (2 evaluations).
+    /// This method applies the final challenge to reduce each MLE to a scalar,
+    /// returning a vector of these scalar evaluations.
+    ///
+    /// This should be called immediately after the last `prove_round_and_update_state`,
+    /// i.e., when `self.round == self.poly.aux_info.num_variables`.
+    ///
+    /// Ported from HyperPianist: .agent/HyperPianist/subroutines/src/poly_iop/sum_check/prover.rs
+    pub fn get_final_mle_evaluations(
+        &mut self,
+        challenge: F,
+    ) -> Result<Vec<F>, PolyIOPErrors> {
+        if self.round != self.poly.aux_info.num_variables {
+            return Err(PolyIOPErrors::InvalidProver(
+                "Prover is not finished yet".to_string(),
+            ));
+        }
+        self.challenges.push(challenge);
+
+        // After all rounds, each MLE has 1 variable left.
+        // Apply the final challenge to get a scalar evaluation.
+        // HyperPianist uses bind_poly_var_bot here, but for a 1-variable MLE,
+        // fix_variables (from the top) is equivalent.
+        #[cfg(feature = "parallel")]
+        let claims = self
+            .poly
+            .flattened_ml_extensions
+            .par_iter()
+            .map(|mle| {
+                let fixed = fix_variables(mle, &[challenge]);
+                fixed.evaluations[0]
+            })
+            .collect();
+        #[cfg(not(feature = "parallel"))]
+        let claims = self
+            .poly
+            .flattened_ml_extensions
+            .iter()
+            .map(|mle| {
+                let fixed = fix_variables(mle, &[challenge]);
+                fixed.evaluations[0]
+            })
+            .collect();
+
+        Ok(claims)
+    }
+}
+
 fn barycentric_weights<F: PrimeField>(points: &[F]) -> Vec<F> {
     let mut weights = points
         .iter()

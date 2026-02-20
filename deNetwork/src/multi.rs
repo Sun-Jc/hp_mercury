@@ -1,6 +1,6 @@
 use crossbeam_channel::{Receiver, Select, Sender};
 use lazy_static::lazy_static;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use mio::{
     net::{TcpListener, TcpStream},
     Events, Interest, Poll, Token,
@@ -226,7 +226,7 @@ fn recv_thread(
                     Ok(false) => peer_closed[peer_id] = true,
                     Ok(true) => {},
                     Err(e) => {
-                        println!("Read error: {e} from client {peer_id}");
+                        error!("Read error: {e} from client {peer_id}");
                         peer_closed[peer_id] = true;
                     },
                 };
@@ -266,7 +266,7 @@ fn recv_thread(
                     Ok(false) => should_return = true,
                     Ok(true) => {},
                     Err(e) => {
-                        println!("Read error: {e}, recv thread now exiting");
+                        error!("Read error: {e}, recv thread now exiting");
                         should_return = true;
                     },
                 };

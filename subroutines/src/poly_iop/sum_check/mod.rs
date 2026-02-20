@@ -23,6 +23,9 @@ use std::{collections::HashMap, fmt::Debug, marker::PhantomData, sync::Arc};
 use rayon::iter::{IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator, IntoParallelIterator};
 use ark_std::time::Instant;
 
+#[cfg(feature = "distributed")]
+use deNetwork::{DeNet, channel::DeSerNet};
+
 mod prover;
 mod verifier;
 
@@ -89,6 +92,24 @@ pub trait SumCheck<F: PrimeField> {
         sums: Vec<F>,
         transcript: &mut IOPTranscript<F>,
     ) -> Result<(Self::SumCheckProof, F, VPAuxInfo<F>, VirtualPolynomial<F>, F), PolyIOPErrors>;
+
+    /// Distributed SumCheck prove using a two-phase protocol.
+    ///
+    /// Phase 1: All parties run `num_vars` rounds of local sumcheck in parallel.
+    ///   After each round, worker messages are aggregated by the master.
+    ///   At the end, each party's MLEs are reduced to scalars via `get_final_mle_evaluations`.
+    ///
+    /// Phase 2 (master only): The master assembles tiny MLEs (one scalar per party)
+    ///   and runs `log₂(K)` additional sumcheck rounds locally.
+    ///
+    /// Workers return `Ok(None)`, the master returns `Ok(Some(proof))`.
+    ///
+    /// Ported from HyperPianist: .agent/HyperPianist/subroutines/src/poly_iop/sum_check/mod.rs
+    #[cfg(feature = "distributed")]
+    fn d_prove<Net: DeSerNet>(
+        poly: &Self::VirtualPolynomial,
+        transcript: &mut Self::Transcript,
+    ) -> Result<Option<Self::SumCheckProof>, PolyIOPErrors>;
 }
 
 /// Trait for sum check protocol prover side APIs.
@@ -159,6 +180,49 @@ pub struct SumCheckSubClaim<F: PrimeField> {
     pub point: Vec<F>,
     /// the expected evaluation
     pub expected_evaluation: F,
+}
+
+/// Verify a SumFold proof.
+///
+/// Replays the prover's transcript flow:
+/// 1. append `q_aux_info` → squeeze `ρ`
+/// 2. standard SumCheck rounds (append prover_msg → squeeze challenge)
+///
+/// Returns `(SumCheckSubClaim, rho)` on success:
+/// - `subclaim.point = r_b` (the folding point)
+/// - `subclaim.expected_evaluation = c` (= v · eq(ρ, r_b))
+/// - `rho` = the random challenges used for folding
+///
+/// The caller should further check: `c == v * eq(ρ, r_b)`.
+pub fn verify_sum_fold<F: PrimeField>(
+    sum_t: F,
+    proof: &IOPProof<F>,
+    q_aux_info: &VPAuxInfo<F>,
+) -> Result<(SumCheckSubClaim<F>, Vec<F>), PolyIOPErrors> {
+    let length = q_aux_info.num_variables;
+
+    // Replay transcript: same operations as prover
+    let mut transcript = IOPTranscript::<F>::new(b"Initializing SumCheck transcript");
+    transcript.append_serializable_element(b"aux info", q_aux_info)?;
+    let rho: Vec<F> = transcript.get_and_append_challenge_vectors(b"sumfold rho", length)?;
+
+    // Verify SumCheck rounds manually (prover did NOT re-append aux_info here)
+    let mut verifier_state = IOPVerifierState::verifier_init(q_aux_info);
+    for i in 0..length {
+        let prover_msg = proof
+            .proofs
+            .get(i)
+            .ok_or_else(|| PolyIOPErrors::InvalidProof("sum_fold proof is incomplete".into()))?;
+        transcript.append_serializable_element(b"prover msg", prover_msg)?;
+        IOPVerifierState::verify_round_and_update_state(
+            &mut verifier_state,
+            prover_msg,
+            &mut transcript,
+        )?;
+    }
+
+    let subclaim = IOPVerifierState::check_and_generate_subclaim(&verifier_state, &sum_t)?;
+    Ok((subclaim, rho))
 }
 
 impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
@@ -246,6 +310,8 @@ impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
     
         transcript.append_serializable_element(b"aux info", &q_aux_info)?;
         let rho: Vec<F> = transcript.get_and_append_challenge_vectors(b"sumfold rho", length)?;
+        tracing::debug!("[sum_fold v1] rho = {:?}", rho);
+        tracing::debug!("[sum_fold v1] input sums = {:?}", sums);
         let eq_poly = EqPolynomial::new(rho.clone());
         let eq_xr_poly = build_eq_x_r(&rho)?;
     
@@ -255,6 +321,7 @@ impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
         for i in 0..m {
             sum_t += eq_xr_vec[i] * sums[i];
         }
+        tracing::debug!("[sum_fold v1] sum_t = {:?}", sum_t);
     
         // compute evaluations of f_j(b,x)
         let new_num_vars = length + num_vars;
@@ -424,9 +491,12 @@ impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
             prover_msgs.push(message);
             challenge = Some(transcript.get_and_append_challenge(b"Internal round")?);
     
+            // Log round challenge (tau)
+            tracing::debug!("[sum_fold v1] round {} tau = {:?}", round, challenge);
+
             // End timer for this round
             let duration = start.elapsed();
-            println!("---------------SumFold Round {:?} Duration {:?}---------",round,duration);
+            tracing::debug!("[sum_fold v1] round {} duration = {:?}", round, duration);
         }
     
         // pushing the last challenge point to the state
@@ -494,6 +564,7 @@ impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
 
         transcript.append_serializable_element(b"aux info", &q_aux_info)?;
         let rho: Vec<F> = transcript.get_and_append_challenge_vectors(b"sumfold rho", length)?;
+        tracing::debug!("[sum_fold v2] rho = {:?}", rho);
         let eq_poly = EqPolynomial::new(rho.clone());
         let eq_xr_poly = build_eq_x_r(&rho)?;
 
@@ -503,6 +574,7 @@ impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
         for i in 0..m {
             sum_t += eq_xr_vec[i] * sums[i];
         }
+        tracing::debug!("[sum_fold v2] sum_t = {:?}", sum_t);
 
         // Stage 3: compute evaluations of f_j(b,x) - interleaved MLE structure
         let new_num_vars = length + num_vars;
@@ -670,6 +742,7 @@ impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
             transcript.append_serializable_element(b"prover msg", &message)?;
             prover_msgs.push(message);
             challenge = Some(transcript.get_and_append_challenge(b"Internal round")?);
+            tracing::debug!("[sum_fold v2] round {} tau = {:?}", round, challenge);
         }
 
         // Push the last challenge
@@ -775,6 +848,7 @@ impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
 
         transcript.append_serializable_element(b"aux info", &q_aux_info)?;
         let rho: Vec<F> = transcript.get_and_append_challenge_vectors(b"sumfold rho", length)?;
+        tracing::debug!("[sum_fold v3] rho = {:?}", rho);
         let eq_poly = EqPolynomial::new(rho.clone());
         let eq_xr_poly = build_eq_x_r(&rho)?;
         let eq_xr_vec = eq_xr_poly.to_evaluations();
@@ -791,6 +865,7 @@ impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
 
         // Compute sum_t = Σᵢ eq(rho, i) * sums[i]
         let sum_t = stage2_compute_sum_t(&sums, &eq_xr_vec);
+        tracing::debug!("[sum_fold v3] sum_t = {:?}", sum_t);
 
         // ═══════════════════════════════════════════════════════════════
         // Stage 3: Merge split MLEs across VPs for each split index
@@ -826,10 +901,9 @@ impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
         let mut challenges = Vec::with_capacity(length);
         let mut eq_fix = eq_xr_poly.as_ref().clone();
 
-        // Clone MLEs for mutation (sequential)
         let mut flattened_ml_extensions: Vec<DenseMultilinearExtension<F>> = compose_poly
             .flattened_ml_extensions
-            .iter()
+            .par_iter()
             .map(|x| x.as_ref().clone())
             .collect();
 
@@ -845,7 +919,11 @@ impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
                 challenges.push(chal);
 
                 let r = challenges[round - 1];
-                // Sequential fix_variables
+                #[cfg(feature = "parallel")]
+                flattened_ml_extensions
+                    .par_iter_mut()
+                    .for_each(|mle| *mle = fix_variables(mle, &[r]));
+                #[cfg(not(feature = "parallel"))]
                 flattened_ml_extensions
                     .iter_mut()
                     .for_each(|mle| *mle = fix_variables(mle, &[r]));
@@ -858,7 +936,7 @@ impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
 
             let mut products_sum = vec![F::zero(); compose_poly.aux_info.max_degree + 1];
 
-            // Compute eq_sum for this round (sequential)
+            // Compute eq_sum for this round
             let mut eq_sum = vec![vec![F::zero(); 1 << (length - round - 1)]; compose_poly.aux_info.max_degree + 1];
             for b in 0..1 << (length - round - 1) {
                 let table = &eq_fix;
@@ -873,60 +951,70 @@ impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
                 });
             }
 
-            // Sequential product accumulation
-            for (coefficient, products) in products_list.iter() {
-                let mut sum = vec![F::zero(); products.len() + 2];
-                let mut partial_acc = vec![vec![F::zero(); 1 << (length - round - 1)]; products.len() + 2];
-
-                for b in 0..1 << (compose_poly.aux_info.num_variables - round - 1) {
-                    let mut buf: Vec<(F, F)> = vec![(F::zero(), F::zero()); products.len()];
-
-                    buf.iter_mut()
-                        .zip(products.iter())
-                        .for_each(|((eval, step), f)| {
-                            let table = &flattened_ml_extensions[*f];
-                            *eval = table[b << 1];
-                            *step = table[(b << 1) + 1] - table[b << 1];
-                        });
-
-                    let bucket = b % (1 << (length - round - 1));
-                    partial_acc[0][bucket] += buf.iter().map(|(eval, _)| eval).product::<F>();
-
-                    for acc_idx in 1..partial_acc.len() {
-                        buf.iter_mut().for_each(|(eval, step)| *eval += *step);
-                        partial_acc[acc_idx][bucket] += buf.iter().map(|(eval, _)| eval).product::<F>();
-                    }
-                }
-
-                // Apply eq_sum weights
-                for (i, partial_row) in partial_acc.iter().enumerate() {
-                    if i < eq_sum.len() {
-                        sum[i] = eq_sum[i]
+            products_list.iter().for_each(|(coefficient, products)| {
+                let bucket_count = 1 << (length - round - 1);
+                let mut sum = cfg_into_iter!(0..1 << (compose_poly.aux_info.num_variables - round - 1))
+                    .fold(
+                        || {
+                            (
+                                vec![(F::zero(), F::zero()); products.len()],
+                                vec![vec![F::zero(); bucket_count]; products.len() + 2],
+                            )
+                        },
+                        |(mut buf, mut acc), b| {
+                            buf.iter_mut()
+                                .zip(products.iter())
+                                .for_each(|((eval, step), f)| {
+                                    let table = &flattened_ml_extensions[*f];
+                                    *eval = table[b << 1];
+                                    *step = table[(b << 1) + 1] - table[b << 1];
+                                });
+                            acc[0][b % bucket_count] += buf.iter().map(|(eval, _)| eval).product::<F>();
+                            acc[1..].iter_mut().for_each(|acc| {
+                                buf.iter_mut().for_each(|(eval, step)| *eval += step as &_);
+                                acc[b % bucket_count] += buf.iter().map(|(eval, _)| eval).product::<F>();
+                            });
+                            (buf, acc)
+                        },
+                    )
+                    .map(|(_, partial)| {
+                        let partial_sum: Vec<F> = eq_sum[..partial.len()]
                             .iter()
-                            .zip(partial_row.iter())
-                            .map(|(a, b)| *a * *b)
-                            .sum::<F>();
-                    }
-                }
+                            .zip(partial.iter())
+                            .map(|(eq_row, partial_row)| {
+                                assert_eq!(eq_row.len(), partial_row.len());
+                                eq_row
+                                    .iter()
+                                    .zip(partial_row)
+                                    .map(|(a, b)| *a * *b)
+                                    .sum::<F>()
+                            })
+                            .collect();
+                        partial_sum
+                    })
+                    .reduce(
+                        || vec![F::zero(); products.len() + 2],
+                        |mut sum, partial_sum| {
+                            sum.iter_mut()
+                                .zip(partial_sum.iter())
+                                .for_each(|(sum, partial_sum)| *sum += partial_sum);
+                            sum
+                        },
+                    );
+                sum.iter_mut().for_each(|sum| *sum *= coefficient);
 
-                sum.iter_mut().for_each(|s| *s *= coefficient);
-
-                // Extrapolate remaining degrees
-                for i in 0..compose_poly.aux_info.max_degree - products.len() - 1 {
-                    let (points, weights) = &extrapolation_aux[products.len()];
-                    let at = F::from((products.len() + 2 + i) as u64);
-                    let extra = extrapolate(points, weights, &sum, &at);
-                    if products.len() + 2 + i < products_sum.len() {
-                        products_sum[products.len() + 2 + i] += extra;
-                    }
-                }
-
-                for (i, s) in sum.iter().enumerate() {
-                    if i < products_sum.len() {
-                        products_sum[i] += *s;
-                    }
-                }
-            }
+                let extrapolation = cfg_into_iter!(0..compose_poly.aux_info.max_degree - products.len() - 1)
+                    .map(|i| {
+                        let (points, weights) = &extrapolation_aux[products.len()];
+                        let at = F::from((products.len() + 2 + i) as u64);
+                        extrapolate(points, weights, &sum, &at)
+                    })
+                    .collect::<Vec<_>>();
+                products_sum
+                    .iter_mut()
+                    .zip(sum.iter().chain(extrapolation.iter()))
+                    .for_each(|(products_sum, sum)| *products_sum += sum);
+            });
 
             let message = IOPProverMessage {
                 evaluations: products_sum,
@@ -934,6 +1022,7 @@ impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
             transcript.append_serializable_element(b"prover msg", &message)?;
             prover_msgs.push(message);
             challenge = Some(transcript.get_and_append_challenge(b"Internal round")?);
+            tracing::debug!("[sum_fold v3] round {} tau = {:?}", round, challenge);
         }
 
         // Push the last challenge
@@ -956,8 +1045,13 @@ impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
         // ═══════════════════════════════════════════════════════════════
         let v = c * eq_poly.evaluate(&rb).inverse().unwrap();
 
-        // Apply final challenge to get folded MLEs (sequential)
         let final_challenge_val = rb[length - 1];
+        #[cfg(feature = "parallel")]
+        let new_mle: Vec<Arc<DenseMultilinearExtension<F>>> = flattened_ml_extensions
+            .par_iter()
+            .map(|mle| Arc::new(fix_variables(mle, &[final_challenge_val])))
+            .collect();
+        #[cfg(not(feature = "parallel"))]
         let new_mle: Vec<Arc<DenseMultilinearExtension<F>>> = flattened_ml_extensions
             .iter()
             .map(|mle| Arc::new(fix_variables(mle, &[final_challenge_val])))
@@ -977,6 +1071,143 @@ impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
         };
 
         Ok((proof, sum_t, q_aux_info, folded_poly, v))
+    }
+
+    /// Distributed SumCheck prove: two-phase protocol.
+    ///
+    /// Phase 1 (all parties): Each party runs `num_vars` rounds of local sumcheck
+    /// on its own polynomial shard. After each round, prover messages are sent to
+    /// the master who aggregates them, then broadcasts the challenge back.
+    ///
+    /// Phase 2 (master only): After Phase 1, each party evaluates its MLEs to
+    /// scalars. The master assembles these into tiny MLEs (one evaluation per party)
+    /// and runs `log₂(K)` additional local sumcheck rounds.
+    ///
+    /// Workers return `Ok(None)`, the master returns `Ok(Some(proof))`.
+    ///
+    /// The total proof has (num_vars + log₂(K)) rounds, proving over the combined
+    /// (num_vars + log₂(K))-variable polynomial.
+    ///
+    /// Ported from HyperPianist: .agent/HyperPianist/subroutines/src/poly_iop/sum_check/mod.rs
+    #[cfg(feature = "distributed")]
+    fn d_prove<Net: DeSerNet>(
+        poly: &Self::VirtualPolynomial,
+        transcript: &mut Self::Transcript,
+    ) -> Result<Option<Self::SumCheckProof>, PolyIOPErrors> {
+        let num_party_vars = log2(Net::n_parties()) as usize;
+
+        // Only master appends aux_info (with extended num_variables) to transcript
+        if Net::am_master() {
+            let mut aux_info = poly.aux_info.clone();
+            aux_info.num_variables += num_party_vars;
+            transcript.append_serializable_element(b"aux info", &aux_info)?;
+        }
+
+        let num_vars = poly.aux_info.num_variables;
+        let max_degree = poly.aux_info.max_degree;
+
+        // Phase 1: All parties run local sumcheck and aggregate via network.
+        // hp_mercury's prover_init takes &poly (borrow), so we pass a reference.
+        let mut prover_state = IOPProverState::prover_init(poly)?;
+        let mut challenge = None;
+        let mut prover_msgs = Vec::with_capacity(num_vars + num_party_vars);
+
+        for _ in 0..num_vars {
+            let mut prover_msg =
+                IOPProverState::prove_round_and_update_state(&mut prover_state, &challenge)?;
+
+            // All parties send their prover message to the master
+            let messages = Net::send_to_master(&prover_msg);
+            if Net::am_master() {
+                // Master aggregates: element-wise sum of all parties' evaluations
+                prover_msg = messages.unwrap().iter().fold(
+                    IOPProverMessage {
+                        evaluations: vec![F::zero(); max_degree + 1],
+                    },
+                    |acc, x| IOPProverMessage {
+                        evaluations: acc
+                            .evaluations
+                            .iter()
+                            .zip(x.evaluations.iter())
+                            .map(|(a, b)| *a + b)
+                            .collect(),
+                    },
+                );
+                transcript.append_serializable_element(b"prover msg", &prover_msg)?;
+            }
+            prover_msgs.push(prover_msg);
+
+            // Master generates challenge and broadcasts to all parties
+            if Net::am_master() {
+                let challenge_value =
+                    transcript.get_and_append_challenge(b"Internal round")?;
+                Net::recv_from_master_uniform(Some(challenge_value));
+                challenge = Some(challenge_value);
+            } else {
+                challenge = Some(Net::recv_from_master_uniform::<F>(None));
+            }
+        }
+
+        // Phase 1 → Phase 2 transition:
+        // Each party evaluates its MLEs at the final challenge to get scalar values.
+        let final_mle_evals =
+            IOPProverState::get_final_mle_evaluations(&mut prover_state, challenge.unwrap())?;
+
+        // Send all scalar evaluations to the master
+        let final_mle_evals = Net::send_to_master(&final_mle_evals);
+
+        // Workers are done; only master continues to Phase 2
+        if !Net::am_master() {
+            return Ok(None);
+        }
+
+        // Phase 2 (master only): Build tiny MLEs from the collected scalars.
+        // Each original MLE becomes a new MLE with `num_party_vars` variables,
+        // where evaluations[i] = party_i's scalar evaluation of that MLE.
+        let final_mle_evals = final_mle_evals.unwrap();
+        let new_mles: Vec<Arc<DenseMultilinearExtension<F>>> = (0..final_mle_evals[0].len())
+            .map(|poly_index| {
+                Arc::new(DenseMultilinearExtension::from_evaluations_vec(
+                    num_party_vars,
+                    final_mle_evals
+                        .iter()
+                        .map(|mle_evals| mle_evals[poly_index])
+                        .collect(),
+                ))
+            })
+            .collect();
+
+        // Build a new VirtualPolynomial with the tiny MLEs
+        let mut phase2_poly = prover_state.poly.clone();
+        phase2_poly.aux_info.num_variables = num_party_vars;
+        phase2_poly.replace_mles(new_mles);
+
+        // Run Phase 2: standard local sumcheck on the tiny polynomial
+        let mut old_challenges = prover_state.challenges.clone();
+        let num_vars_phase2 = phase2_poly.aux_info.num_variables;
+        let mut prover_state_phase2 = IOPProverState::prover_init(&phase2_poly)?;
+        challenge = None;
+        for _ in 0..num_vars_phase2 {
+            let prover_msg = IOPProverState::prove_round_and_update_state(
+                &mut prover_state_phase2,
+                &challenge,
+            )?;
+            transcript.append_serializable_element(b"prover msg", &prover_msg)?;
+            prover_msgs.push(prover_msg);
+            challenge = Some(transcript.get_and_append_challenge(b"Internal round")?);
+        }
+        // Push the last challenge
+        if let Some(p) = challenge {
+            prover_state_phase2.challenges.push(p);
+        }
+
+        // Combine challenges from both phases
+        old_challenges.append(&mut prover_state_phase2.challenges);
+
+        Ok(Some(IOPProof {
+            point: old_challenges,
+            proofs: prover_msgs,
+        }))
     }
 }
 

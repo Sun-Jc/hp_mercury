@@ -168,6 +168,19 @@ impl<F: PrimeField> VirtualPolynomial<F> {
         Ok(())
     }
 
+    /// Replace all MLEs in this VirtualPolynomial with a new set of MLEs.
+    /// Rebuilds the raw_pointers_lookup_table accordingly.
+    ///
+    /// Ported from HyperPianist: .agent/HyperPianist/arithmetic/src/virtual_polynomial.rs
+    pub fn replace_mles(&mut self, new_mle_list: Vec<Arc<DenseMultilinearExtension<F>>>) {
+        self.flattened_ml_extensions = new_mle_list;
+        self.raw_pointers_lookup_table = HashMap::new();
+        for (index, mle) in self.flattened_ml_extensions.iter().enumerate() {
+            let mle_ptr = Arc::as_ptr(mle);
+            self.raw_pointers_lookup_table.insert(mle_ptr, index);
+        }
+    }
+
     /// Multiple the current VirtualPolynomial by an MLE:
     /// - add the MLE to the MLE list;
     /// - multiple each product by MLE and its coefficient.
