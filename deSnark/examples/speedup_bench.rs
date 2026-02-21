@@ -2,7 +2,10 @@
 //!
 //! Measures "pure prove" time (no verify, no debug assertions) for:
 //!   - Single-node:  prove_sumfold + SumCheck::prove  (RAYON_NUM_THREADS=2)
-//!   - Distributed:  dist_prove_sumcheck (4 nodes, RAYON_NUM_THREADS=2 each)
+//!   - Distributed:  d_sumfold + d_prove (4 nodes, RAYON_NUM_THREADS=2 each)
+//!
+//! Reports per-phase timings (sumfold, sumcheck) plus total, enabling
+//! phase-level speedup analysis.
 //!
 //! Usage:
 //! ```bash
@@ -16,8 +19,8 @@
 use ark_bls12_381::{Bls12_381, Fr};
 use deNetwork::{DeMultiNet as Net, DeNet};
 use deSnark::{
-    circuits_to_sumcheck, dist_prove_sumcheck, make_circuit, prove_sumfold, setup, Config,
-    MockCircuit, NetworkConfig, SumCheckInstance,
+    circuits_to_sumcheck, make_circuit, prove_sumfold, setup, Config, MockCircuit, NetworkConfig,
+    SumCheckInstance,
 };
 use deSnark::snark::ProvingKey;
 use std::env;
@@ -44,8 +47,6 @@ fn main() {
         std::process::exit(1);
     });
 
-    // Single-node: override K=1 so each circuit has full N constraints
-    // (distributed: each party handles M instances × N/K constraints)
     if opts.mode == "single" {
         config.log_num_parties = 0;
     }
@@ -77,25 +78,41 @@ fn main() {
 }
 
 fn run_single(pk: &ProvingKey<E, PCS>, circuits: &[MockCircuit<Fr>], iters: usize) {
-    let mut times_us: Vec<u128> = Vec::with_capacity(iters);
+    let mut t_sumfold = Vec::with_capacity(iters);
+    let mut t_sumcheck = Vec::with_capacity(iters);
+    let mut t_total = Vec::with_capacity(iters);
 
     for i in 0..iters {
         let instances: Vec<SumCheckInstance<Fr>> =
             circuits_to_sumcheck::<E, PCS>(pk, circuits).expect("circuits_to_sumcheck failed");
 
-        let start = Instant::now();
+        let t0 = Instant::now();
         let mut transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
         let (folded, _) =
             prove_sumfold(instances, &mut transcript).expect("prove_sumfold failed");
+        let d_sf = t0.elapsed();
+
+        let t1 = Instant::now();
         let _proof = <PolyIOP<Fr> as SumCheck<Fr>>::prove(&folded.poly, &mut transcript)
             .expect("SumCheck::prove failed");
-        let us = start.elapsed().as_micros();
+        let d_sc = t1.elapsed();
 
-        times_us.push(us);
-        eprintln!("[single] iter {}: {} us", i, us);
+        let total = d_sf + d_sc;
+        t_sumfold.push(d_sf.as_micros());
+        t_sumcheck.push(d_sc.as_micros());
+        t_total.push(total.as_micros());
+        eprintln!(
+            "[single] iter {}: sumfold={} us, sumcheck={} us, total={} us",
+            i,
+            d_sf.as_micros(),
+            d_sc.as_micros(),
+            total.as_micros()
+        );
     }
 
-    print_result("single", &times_us);
+    print_result("single/sumfold", &t_sumfold);
+    print_result("single/sumcheck", &t_sumcheck);
+    print_result("single/total", &t_total);
 }
 
 fn run_dist(
@@ -114,7 +131,9 @@ fn run_dist(
         Net::n_parties()
     );
 
-    let mut times_us: Vec<u128> = Vec::with_capacity(iters);
+    let mut t_sumfold = Vec::with_capacity(iters);
+    let mut t_sumcheck = Vec::with_capacity(iters);
+    let mut t_total = Vec::with_capacity(iters);
 
     for i in 0..iters {
         let instances: Vec<SumCheckInstance<Fr>> =
@@ -122,17 +141,53 @@ fn run_dist(
         let (polys, sums): (Vec<_>, Vec<_>) =
             instances.into_iter().map(|inst| (inst.poly, inst.sum)).unzip();
 
-        let start = Instant::now();
-        let _proof = dist_prove_sumcheck(polys, sums).expect("dist_prove_sumcheck failed");
-        let us = start.elapsed().as_micros();
+        let mut transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
 
-        times_us.push(us);
+        // Phase 1: d_sumfold
+        let t0 = Instant::now();
+        let transcript_opt = if Net::am_master() {
+            Some(&mut transcript)
+        } else {
+            None
+        };
+        let (folded_instance, _sumfold_proof) =
+            deSnark::d_sumfold::d_sumfold::<Fr, Net>(polys, sums, transcript_opt)
+                .expect("d_sumfold failed");
+        let d_sf = t0.elapsed();
+
+        // Phase 2: d_prove (HyperPianist distributed SumCheck)
+        let t1 = Instant::now();
+        let transcript_opt = if Net::am_master() {
+            Some(&mut transcript)
+        } else {
+            None
+        };
+        let _hp_proof = <PolyIOP<Fr> as SumCheck<Fr>>::d_prove::<Net>(
+            &folded_instance.poly,
+            transcript_opt,
+        )
+        .expect("d_prove failed");
+        let d_sc = t1.elapsed();
+
+        let total = d_sf + d_sc;
+        t_sumfold.push(d_sf.as_micros());
+        t_sumcheck.push(d_sc.as_micros());
+        t_total.push(total.as_micros());
+
         let role = if Net::am_master() { "master" } else { "worker" };
-        eprintln!("[dist/{}] iter {}: {} us", role, i, us);
+        eprintln!(
+            "[dist/{}] iter {}: sumfold={} us, sumcheck={} us, total={} us",
+            role, i,
+            d_sf.as_micros(),
+            d_sc.as_micros(),
+            total.as_micros()
+        );
     }
 
     if Net::am_master() {
-        print_result("dist", &times_us);
+        print_result("dist/sumfold", &t_sumfold);
+        print_result("dist/sumcheck", &t_sumcheck);
+        print_result("dist/total", &t_total);
     }
 
     Net::deinit();
