@@ -423,6 +423,84 @@ pub fn prove_sumfold<F: PrimeField>(
     Ok((folded_instance, sumfold_proof))
 }
 
+/// **v2 unified prover** (single-machine): folds M instances via SumFold,
+/// then scales the folded polynomial by `eq(ρ, r_b)` and proves the
+/// HyperPianist phase on the **same** transcript without an intermediate
+/// `aux_info` marker.  The result is a proof that can be verified as a
+/// single SumCheck with `claimed_sum = sum_t`.
+///
+/// The round polynomial degree is uniformly `q_aux_info.max_degree`
+/// across both phases (SumFold rounds naturally have +1 from eq; the
+/// HyperPianist prover extrapolates one extra evaluation to match).
+pub fn prove_sumcheck_v2<F: PrimeField>(
+    instances: Vec<SumCheckInstance<F>>,
+) -> Result<Proof<F>> {
+    if instances.is_empty() {
+        return Err(DeSnarkError::InvalidParameters("no instances".into()));
+    }
+    if !instances.len().is_power_of_two() {
+        return Err(DeSnarkError::InvalidParameters(format!(
+            "number of instances must be power of 2, got {}",
+            instances.len()
+        )));
+    }
+
+    let m = instances.len();
+    let length = ark_std::log2(m) as usize;
+
+    let (polys, sums): (Vec<_>, Vec<_>) = instances
+        .into_iter()
+        .map(|inst| (inst.poly, inst.sum))
+        .unzip();
+
+    // Phase 1: SumFold (appends q_aux_info, squeezes ρ, runs log₂M rounds)
+    let mut transcript = <PolyIOP<F> as SumCheck<F>>::init_transcript();
+    let (sumfold_proof, sum_t, q_aux_info, mut folded_poly, v) =
+        <PolyIOP<F> as SumCheck<F>>::sum_fold_v2(polys, sums, &mut transcript)
+            .map_err(|e| DeSnarkError::HyperPlonkError(format!("sum_fold v2 failed: {e}")))?;
+
+    // Re-derive ρ from q_aux_info (deterministic Fiat-Shamir replay)
+    let mut rho_transcript = <PolyIOP<F> as SumCheck<F>>::init_transcript();
+    rho_transcript
+        .append_serializable_element(b"aux info", &q_aux_info)
+        .map_err(|e| DeSnarkError::HyperPlonkError(format!("rho transcript: {e}")))?;
+    let rho: Vec<F> = rho_transcript
+        .get_and_append_challenge_vectors(b"sumfold rho", length)
+        .map_err(|e| DeSnarkError::HyperPlonkError(format!("rho squeeze: {e}")))?;
+
+    let r_b = &sumfold_proof.point;
+    let eq_rho = EqPolynomial::new(rho);
+    let scale = eq_rho.evaluate(r_b);
+
+    // Scale folded polynomial so that its sum becomes c = v · eq(ρ, r_b),
+    // making the chain continuous across the SumFold / HP boundary.
+    folded_poly.scale_by_scalar(&scale);
+    folded_poly.aux_info.max_degree = q_aux_info.max_degree;
+
+    // Phase 2: HyperPianist SumCheck (no aux_info append — continues transcript)
+    let hp_proof =
+        <PolyIOP<F> as SumCheck<F>>::prove_continue(&folded_poly, &mut transcript)
+            .map_err(|e| DeSnarkError::HyperPlonkError(format!("prove_continue: {e}")))?;
+
+    // Assemble combined proof
+    let num_sumfold_rounds = sumfold_proof.proofs.len();
+    let mut combined_point = sumfold_proof.point;
+    combined_point.extend(hp_proof.point);
+    let mut combined_proofs = sumfold_proof.proofs;
+    combined_proofs.extend(hp_proof.proofs);
+
+    Ok(Proof {
+        proof: IOPProof {
+            point: combined_point,
+            proofs: combined_proofs,
+        },
+        num_sumfold_rounds,
+        sum_t,
+        q_aux_info,
+        v,
+    })
+}
+
 /// Combine and verify K parties' SumFold proofs (pure verifier — no witness data).
 ///
 /// In the distributed SumFold protocol, all K parties share the same
@@ -874,6 +952,107 @@ fn verify_proof_eval<E: Pairing>(
     Ok(())
 }
 
+/// **v2 verifier**: treats the entire proof as a single SumCheck with
+/// `claimed_sum = sum_t`.  No separate SumFold consistency check — it is
+/// absorbed into the SumCheck itself.
+///
+/// Steps:
+///   1. Run `verify_unified_sumcheck` → `(subclaim, ρ)`
+///   2. Split `subclaim.point` into `r_b` (SumFold vars) and `r_x` (HP vars)
+///   3. Compute `eq(ρ, r_b) · P_{r_b}(r_x)` from circuit data
+///   4. Check `subclaim.expected_evaluation == eq(ρ, r_b) · folded_eval`
+fn verify_proof_eval_v2<E: Pairing>(
+    proof: &Proof<E::ScalarField>,
+    pk: &ProvingKey<E, impl PolynomialCommitmentScheme<E>>,
+    circuits: &[MockCircuit<E::ScalarField>],
+    instances_aux: &VPAuxInfo<E::ScalarField>,
+) -> Result<()> {
+    use subroutines::poly_iop::sum_check::verify_unified_sumcheck;
+
+    let num_vars = instances_aux.num_variables;
+    let total_rounds = proof.proof.proofs.len();
+    let combined_max_degree = proof.q_aux_info.max_degree;
+
+    // ═══════════════════════════════════════════════════════════════
+    // Step 1: Single unified SumCheck verification
+    // ═══════════════════════════════════════════════════════════════
+    let mut transcript =
+        <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::init_transcript();
+
+    let (subclaim, rho) = verify_unified_sumcheck(
+        proof.sum_t,
+        &proof.proof,
+        &proof.q_aux_info,
+        combined_max_degree,
+        total_rounds,
+        &mut transcript,
+    )
+    .map_err(|e| {
+        DeSnarkError::HyperPlonkError(format!("unified SumCheck verification failed: {e}"))
+    })?;
+
+    info!(
+        "Unified SumCheck passed: {} rounds, sum_t={:?}",
+        total_rounds, proof.sum_t
+    );
+
+    // ═══════════════════════════════════════════════════════════════
+    // Step 2: Evaluate folded polynomial at the challenge point
+    // ═══════════════════════════════════════════════════════════════
+    let r_b = &subclaim.point[..proof.num_sumfold_rounds];
+    let r_x = &subclaim.point[proof.num_sumfold_rounds..];
+    let r_phase1 = &r_x[..num_vars];
+
+    let eq_rho = EqPolynomial::new(rho);
+    let eq_at_rb = eq_rho.evaluate(r_b);
+
+    let eq_rb_vec = build_eq_x_r_vec(r_b)
+        .map_err(|e| DeSnarkError::HyperPlonkError(format!("build_eq_x_r_vec: {e}")))?;
+
+    let gate_func = &pk.params.gate_func;
+    let num_selectors = circuits[0].index.selectors.len();
+    let num_witnesses = circuits[0].witnesses.len();
+
+    let mut folded_sel_evals =
+        vec![E::ScalarField::from(0u64); num_selectors];
+    let mut folded_wit_evals =
+        vec![E::ScalarField::from(0u64); num_witnesses];
+
+    for (i, circuit) in circuits.iter().enumerate() {
+        let w = eq_rb_vec[i];
+        for (j, sel) in circuit.index.selectors.iter().enumerate() {
+            let mle = DenseMultilinearExtension::from(sel);
+            folded_sel_evals[j] += w * mle.evaluate(r_phase1).unwrap();
+        }
+        for (j, wit) in circuit.witnesses.iter().enumerate() {
+            let mle = DenseMultilinearExtension::from(wit);
+            folded_wit_evals[j] += w * mle.evaluate(r_phase1).unwrap();
+        }
+    }
+
+    let folded_eval = eval_f(gate_func, &folded_sel_evals, &folded_wit_evals)
+        .map_err(|e| DeSnarkError::HyperPlonkError(format!("eval_f: {e}")))?;
+
+    // ═══════════════════════════════════════════════════════════════
+    // Step 3: v2 check — consistency absorbed into eval check
+    //
+    // The unified polynomial is G(b,x) = eq(ρ,b) · P_b(x), so
+    //   G(r_b, r_x) = eq(ρ, r_b) · P_{r_b}(r_x) = eq(ρ, r_b) · folded_eval
+    // ═══════════════════════════════════════════════════════════════
+    let expected = eq_at_rb * folded_eval;
+    if subclaim.expected_evaluation != expected {
+        return Err(DeSnarkError::HyperPlonkError(format!(
+            "v2 eval mismatch: subclaim={:?}, eq(ρ,r_b)*folded_eval={:?}",
+            subclaim.expected_evaluation, expected
+        )));
+    }
+    info!(
+        "✅ v2 unified verification passed: eq(ρ,r_b)*folded_eval={:?}",
+        expected
+    );
+    Ok(())
+}
+
 pub fn dist_prove<E: Pairing, PCS: HyperPlonkPCS<E>>(
     config: &Config,
 ) -> Result<(VerifyingKey<E, PCS>, Option<Proof<E::ScalarField>>)> {
@@ -1012,5 +1191,46 @@ mod tests {
             .expect("merge_and_verify_sumfold failed");
 
         println!("Verified: v_total={:?}", v_total);
+    }
+
+    /// v2 end-to-end: prove with unified SumCheck, verify with single-pass verifier.
+    ///
+    /// Proves via `prove_sumcheck_v2` (SumFold + scaled HP as one SumCheck),
+    /// then verifies via `verify_proof_eval_v2` (no separate consistency check).
+    #[test]
+    fn test_prove_and_verify_v2() {
+        use ark_bn254::{Bn254, Fr};
+        use subroutines::MultilinearKzgPCS;
+
+        let config = Config::new(2, 10, GateType::Vanilla, 2);
+
+        let srs = setup::<Bn254, MultilinearKzgPCS<Bn254>>(&config)
+            .expect("SRS generation failed");
+        let (pk, _vk, circuits) =
+            make_circuit::<Bn254, MultilinearKzgPCS<Bn254>>(&config, &srs)
+                .expect("make_circuit failed");
+
+        let instances =
+            circuits_to_sumcheck::<Bn254, MultilinearKzgPCS<Bn254>>(&pk, &circuits)
+                .expect("circuits_to_sumcheck failed");
+        assert_eq!(instances.len(), 4);
+
+        let instances_aux = instances[0].aux_info().clone();
+
+        let proof = prove_sumcheck_v2(instances).expect("prove_sumcheck_v2 failed");
+
+        println!(
+            "v2 proof: {} total rounds ({} sumfold + {} HP), sum_t={:?}, v={:?}",
+            proof.proof.proofs.len(),
+            proof.num_sumfold_rounds,
+            proof.proof.proofs.len() - proof.num_sumfold_rounds,
+            proof.sum_t,
+            proof.v,
+        );
+
+        verify_proof_eval_v2::<Bn254>(&proof, &pk, &circuits, &instances_aux)
+            .expect("verify_proof_eval_v2 failed");
+
+        println!("✅ v2 prove + verify passed");
     }
 }

@@ -60,6 +60,15 @@ pub trait SumCheck<F: PrimeField> {
         transcript: &mut Self::Transcript,
     ) -> Result<Self::SumCheckProof, PolyIOPErrors>;
 
+    /// Like [`prove`](Self::prove), but does NOT append `aux_info` to the
+    /// transcript.  Use when the transcript has already been set up by a
+    /// preceding phase (e.g. SumFold) and must continue without an
+    /// intermediate `aux_info` marker.
+    fn prove_continue(
+        poly: &Self::VirtualPolynomial,
+        transcript: &mut Self::Transcript,
+    ) -> Result<Self::SumCheckProof, PolyIOPErrors>;
+
     /// Verify the claimed sum using the proof
     fn verify(
         sum: F,
@@ -256,6 +265,60 @@ pub fn verify_sum_fold_with_transcript<F: PrimeField>(
     Ok((subclaim, rho))
 }
 
+/// Unified v2 SumCheck verifier: treats SumFold + HyperPianist rounds as
+/// a single SumCheck with `claimed_sum = sum_t`.
+///
+/// Transcript protocol (must match the v2 prover):
+///   1. `append(b"aux info", q_aux_info)`
+///   2. `squeeze(b"sumfold rho")` → ρ
+///   3. For each of the `combined_num_vars` rounds:
+///      `append(b"prover msg", msg)` + `squeeze(b"Internal round")`
+///
+/// Returns `(subclaim, ρ)` where `subclaim.point = r_b ∥ r_x`.
+/// The caller verifies:
+///   `subclaim.expected_evaluation == eq(ρ, r_b) · P_{r_b}(r_x)`
+pub fn verify_unified_sumcheck<F: PrimeField>(
+    sum_t: F,
+    proof: &IOPProof<F>,
+    q_aux_info: &VPAuxInfo<F>,
+    combined_max_degree: usize,
+    combined_num_vars: usize,
+    transcript: &mut IOPTranscript<F>,
+) -> Result<(SumCheckSubClaim<F>, Vec<F>), PolyIOPErrors> {
+    transcript.append_serializable_element(b"aux info", q_aux_info)?;
+    let rho: Vec<F> =
+        transcript.get_and_append_challenge_vectors(b"sumfold rho", q_aux_info.num_variables)?;
+
+    let combined_aux = VPAuxInfo {
+        num_variables: combined_num_vars,
+        max_degree: combined_max_degree,
+        phantom: PhantomData::default(),
+    };
+    let mut verifier_state = IOPVerifierState::verifier_init(&combined_aux);
+
+    for i in 0..combined_num_vars {
+        let prover_msg = proof
+            .proofs
+            .get(i)
+            .ok_or_else(|| {
+                PolyIOPErrors::InvalidProof(format!(
+                    "unified proof incomplete: expected {} rounds, got {}",
+                    combined_num_vars,
+                    proof.proofs.len()
+                ))
+            })?;
+        transcript.append_serializable_element(b"prover msg", prover_msg)?;
+        IOPVerifierState::verify_round_and_update_state(
+            &mut verifier_state,
+            prover_msg,
+            transcript,
+        )?;
+    }
+
+    let subclaim = IOPVerifierState::check_and_generate_subclaim(&verifier_state, &sum_t)?;
+    Ok((subclaim, rho))
+}
+
 impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
     type SumCheckProof = IOPProof<F>;
     type VirtualPolynomial = VirtualPolynomial<F>;
@@ -291,6 +354,30 @@ impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
             challenge = Some(transcript.get_and_append_challenge(b"Internal round")?);
         }
         // pushing the last challenge point to the state
+        if let Some(p) = challenge {
+            prover_state.challenges.push(p)
+        };
+
+        Ok(IOPProof {
+            point: prover_state.challenges,
+            proofs: prover_msgs,
+        })
+    }
+
+    fn prove_continue(
+        poly: &Self::VirtualPolynomial,
+        transcript: &mut Self::Transcript,
+    ) -> Result<Self::SumCheckProof, PolyIOPErrors> {
+        let mut prover_state = IOPProverState::prover_init(poly)?;
+        let mut challenge = None;
+        let mut prover_msgs = Vec::with_capacity(poly.aux_info.num_variables);
+        for _ in 0..poly.aux_info.num_variables {
+            let prover_msg =
+                IOPProverState::prove_round_and_update_state(&mut prover_state, &challenge)?;
+            transcript.append_serializable_element(b"prover msg", &prover_msg)?;
+            prover_msgs.push(prover_msg);
+            challenge = Some(transcript.get_and_append_challenge(b"Internal round")?);
+        }
         if let Some(p) = challenge {
             prover_state.challenges.push(p)
         };

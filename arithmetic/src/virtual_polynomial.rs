@@ -317,6 +317,14 @@ impl<F: PrimeField> VirtualPolynomial<F> {
         copy
     }
     
+    /// Multiply every product coefficient by `scalar`, effectively scaling
+    /// the entire polynomial: `P(x) → scalar · P(x)`.
+    pub fn scale_by_scalar(&mut self, scalar: &F) {
+        for (coeff, _) in &mut self.products {
+            *coeff *= scalar;
+        }
+    }
+
     /// Sample a random virtual polynomial that evaluates to zero everywhere
     /// over the boolean hypercube.
     pub fn rand_zero<R: RngCore>(
