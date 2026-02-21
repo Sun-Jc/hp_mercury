@@ -36,6 +36,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 name = "bench"
 harness = false
 
+[[bench]]
+name = "sumfold_profile"
+harness = false
+
 [features]
 default = ["parallel"]
 parallel = [
