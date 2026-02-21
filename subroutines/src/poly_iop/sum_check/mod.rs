@@ -30,8 +30,6 @@ use tracing::instrument;
 mod prover;
 mod verifier;
 
-#[cfg(feature = "distributed")]
-pub mod dist_sum_fold;
 
 /// Trait for doing sum check protocols.
 pub trait SumCheck<F: PrimeField> {
@@ -219,6 +217,38 @@ pub fn verify_sum_fold<F: PrimeField>(
             &mut verifier_state,
             prover_msg,
             &mut transcript,
+        )?;
+    }
+
+    let subclaim = IOPVerifierState::check_and_generate_subclaim(&verifier_state, &sum_t)?;
+    Ok((subclaim, rho))
+}
+
+/// Same as [`verify_sum_fold`] but operates on a caller-provided transcript
+/// instead of creating a fresh one. This allows the caller to thread a single
+/// Fiat-Shamir transcript across SumFold and subsequent protocol phases.
+pub fn verify_sum_fold_with_transcript<F: PrimeField>(
+    sum_t: F,
+    proof: &IOPProof<F>,
+    q_aux_info: &VPAuxInfo<F>,
+    transcript: &mut IOPTranscript<F>,
+) -> Result<(SumCheckSubClaim<F>, Vec<F>), PolyIOPErrors> {
+    let length = q_aux_info.num_variables;
+
+    transcript.append_serializable_element(b"aux info", q_aux_info)?;
+    let rho: Vec<F> = transcript.get_and_append_challenge_vectors(b"sumfold rho", length)?;
+
+    let mut verifier_state = IOPVerifierState::verifier_init(q_aux_info);
+    for i in 0..length {
+        let prover_msg = proof
+            .proofs
+            .get(i)
+            .ok_or_else(|| PolyIOPErrors::InvalidProof("sum_fold proof is incomplete".into()))?;
+        transcript.append_serializable_element(b"prover msg", prover_msg)?;
+        IOPVerifierState::verify_round_and_update_state(
+            &mut verifier_state,
+            prover_msg,
+            transcript,
         )?;
     }
 

@@ -6,7 +6,6 @@
 #     build     — build the example binary
 #     run       — run 4 nodes, print summary (default)
 #     tmux      — run 4 nodes in tmux 2x2 grid (sync-scrollable)
-#     multitail — run 4 nodes with multitail live view
 #     logs      — show logs from previous run
 #     clean     — kill processes and remove logs
 
@@ -180,34 +179,6 @@ do_tmux() {
     tmux kill-session -t "$SESSION" 2>/dev/null || true
 }
 
-do_multitail() {
-    check_binary
-    if ! command -v multitail &>/dev/null; then
-        echo -e "${RED}multitail not found. Install with: brew install multitail${NC}"
-        exit 1
-    fi
-
-    kill_existing
-    setup_logs
-    echo -e "${BLUE}Starting 4 nodes + multitail...${NC}"
-    echo ""
-    echo -e "${YELLOW}Keybindings:${NC}"
-    echo -e "  ${CYAN}b${NC}          Enter scrollback mode (select window 0-3)"
-    echo -e "  ${CYAN}↑/↓${NC}        Scroll up/down in selected window"
-    echo -e "  ${CYAN}q${NC}          Exit scrollback mode"
-    echo -e "  ${CYAN}q${NC} (main)   Quit multitail"
-    echo ""
-    start_nodes
-
-    multitail -m 10000 -bw a -s 2 \
-        -t "Party 0 (Master)" -ci green "$LOG_DIR/party0.log" \
-        -t "Party 1 (Worker)" -ci cyan "$LOG_DIR/party1.log" \
-        -t "Party 2 (Worker)" -ci yellow "$LOG_DIR/party2.log" \
-        -t "Party 3 (Worker)" -ci magenta "$LOG_DIR/party3.log"
-
-    kill_existing
-}
-
 do_logs() {
     for i in 0 1 2 3; do
         echo -e "${BLUE}─── Party $i ───${NC}"
@@ -228,9 +199,8 @@ case "${1:-run}" in
     build)     do_build ;;
     run)       do_run ;;
     tmux)      do_tmux ;;
-    multitail) do_multitail ;;
     logs)      do_logs ;;
     clean)     do_clean ;;
-    -h|--help) echo "Usage: $0 {build|run|tmux|multitail|logs|clean}" ;;
+    -h|--help) echo "Usage: $0 {build|run|tmux|logs|clean}" ;;
     *)         echo -e "${RED}Unknown: $1${NC}"; exit 1 ;;
 esac

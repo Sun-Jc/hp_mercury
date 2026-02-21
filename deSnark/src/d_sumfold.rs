@@ -367,17 +367,6 @@ pub fn d_sumfold<F: PrimeField, N: DeSerNet>(
         );
 
         challenge = Some(tau);
-
-        // Master also broadcasts the aggregated message so workers can compute
-        // correct interpolation at the final round
-        let _agg_broadcast: IOPProverMessage<F> = N::recv_from_master_uniform(aggregated_msg);
-
-        // If this is the last round, workers need the aggregated final msg
-        // for interpolation to get c (used to compute v)
-        if round == length - 1 {
-            // Store aggregated final-round message for Stage 6
-            // We'll compute c from the aggregated message, not partial
-        }
     }
 
     // Push the last challenge

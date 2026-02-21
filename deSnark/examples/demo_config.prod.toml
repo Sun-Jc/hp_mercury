@@ -8,7 +8,7 @@
 log_num_instances = 4 # M = 16
 
 # μ = log2(N), where N = number of constraints per instance
-log_num_constraints = 23 # N = 2^20 = 1,048,576
+log_num_constraints = 20 # N = 2^20 = 1,048,576
 
 # Gate type: "vanilla"
 gate_type = "vanilla"

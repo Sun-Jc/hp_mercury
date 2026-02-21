@@ -19,7 +19,7 @@ use std::sync::Arc;
 use ark_std::time::Instant;
 use subroutines::pcs::PolynomialCommitmentScheme;
 use subroutines::poly_iop::prelude::{PolyIOP, SumCheck};
-use subroutines::poly_iop::sum_check::verify_sum_fold;
+use subroutines::poly_iop::sum_check::{verify_sum_fold, verify_sum_fold_with_transcript};
 use subroutines::{BatchProof, Commitment, IOPProof};
 use tracing::{debug, info, instrument, warn};
 use transcript::IOPTranscript;
@@ -752,36 +752,50 @@ fn verify_proof_eval<E: Pairing>(
     let total_hp_rounds = proof.proof.proofs.len() - proof.num_sumfold_rounds;
 
     // ═══════════════════════════════════════════════════════════════
-    // Step 1: Replay full transcript and verify HyperPianist SumCheck
+    // Step 1a: Verify SumFold SumCheck on a shared transcript
     //
-    // The prover's transcript was threaded: SumFold → d_prove.
-    // We must replay SumFold operations first so the transcript state
-    // matches, then verify the HyperPianist portion.
+    // A single Fiat-Shamir transcript threads through SumFold →
+    // HyperPianist.  We verify SumFold first (appending aux_info,
+    // squeezing ρ, verifying each round), then continue on the
+    // same transcript for HyperPianist.
     // ═══════════════════════════════════════════════════════════════
     let mut transcript =
         <PolyIOP<E::ScalarField> as SumCheck<E::ScalarField>>::init_transcript();
 
-    // Replay SumFold transcript operations
-    transcript
-        .append_serializable_element(b"aux info", &proof.q_aux_info)
-        .map_err(|e| DeSnarkError::HyperPlonkError(format!("transcript replay: {e}")))?;
-    let _rho: Vec<E::ScalarField> = transcript
-        .get_and_append_challenge_vectors(b"sumfold rho", proof.num_sumfold_rounds)
-        .map_err(|e| DeSnarkError::HyperPlonkError(format!("transcript replay: {e}")))?;
-    for i in 0..proof.num_sumfold_rounds {
-        transcript
-            .append_serializable_element(b"prover msg", &proof.proof.proofs[i])
-            .map_err(|e| {
-                DeSnarkError::HyperPlonkError(format!("transcript replay round {i}: {e}"))
-            })?;
-        transcript
-            .get_and_append_challenge(b"Internal round")
-            .map_err(|e| {
-                DeSnarkError::HyperPlonkError(format!("transcript replay challenge {i}: {e}"))
-            })?;
-    }
+    let sumfold_proof = IOPProof {
+        point: proof.proof.point[..proof.num_sumfold_rounds].to_vec(),
+        proofs: proof.proof.proofs[..proof.num_sumfold_rounds].to_vec(),
+    };
 
-    // d_prove uses extended aux_info (num_variables includes party variables)
+    let (sumfold_subclaim, rho) =
+        verify_sum_fold_with_transcript(
+            proof.sum_t,
+            &sumfold_proof,
+            &proof.q_aux_info,
+            &mut transcript,
+        )
+        .map_err(|e| DeSnarkError::HyperPlonkError(format!(
+            "SumFold SumCheck verification failed: {e}"
+        )))?;
+
+    // Consistency check: c == v · eq(ρ, r_b)
+    let eq_rho = EqPolynomial::new(rho);
+    let eq_at_rb = eq_rho.evaluate(&sumfold_subclaim.point);
+    let expected_c = proof.v * eq_at_rb;
+    if sumfold_subclaim.expected_evaluation != expected_c {
+        return Err(DeSnarkError::HyperPlonkError(format!(
+            "SumFold consistency check failed: c={:?} != v*eq(rho,r_b)={:?}",
+            sumfold_subclaim.expected_evaluation, expected_c
+        )));
+    }
+    info!(
+        "SumFold verification passed: v={:?}, {} rounds",
+        proof.v, proof.num_sumfold_rounds
+    );
+
+    // ═══════════════════════════════════════════════════════════════
+    // Step 1b: Verify HyperPianist SumCheck (same transcript)
+    // ═══════════════════════════════════════════════════════════════
     let mut hp_aux_info = instances_aux.clone();
     hp_aux_info.num_variables = total_hp_rounds;
 

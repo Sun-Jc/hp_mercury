@@ -132,21 +132,29 @@ sleep 2
 
 ## Verification: `verify_proof_eval`
 
-After the distributed proving pipeline completes, the master runs `verify_proof_eval` to check that the SumCheck proof is consistent with the original circuit data. This is the SumCheck protocol's final "oracle query" step: SumCheck reduces "sum over the boolean hypercube" to "evaluation at a random point", and `verify_proof_eval` fulfills that evaluation using the raw circuit polynomials.
+After the distributed proving pipeline completes, the master runs `verify_proof_eval` to check that the combined proof (SumFold + HyperPianist) is valid and consistent with the original circuit data.
 
-### Step 1: Replay Transcript and Verify HyperPianist SumCheck
+### Step 1: Verify SumFold + HyperPianist on a shared transcript
 
-The prover threads a single Fiat-Shamir transcript through SumFold → d_prove (HyperPianist). The verifier must replay the same transcript operations to derive identical challenges.
+The prover threads a single Fiat-Shamir transcript through SumFold and then HyperPianist. The verifier uses the same single transcript to verify both phases sequentially:
+
+**Step 1a — SumFold SumCheck**
 
 1. **Initialize** a fresh `IOPTranscript`.
-2. **Replay SumFold operations**:
-   - Append `q_aux_info` to the transcript.
-   - Generate the challenge vector ρ = (ρ₁, …, ρ_{log₂M}) via `get_and_append_challenge_vectors("sumfold rho")`.
-   - For each of the `num_sumfold_rounds` rounds, append the prover message and generate the round challenge.
-3. **Split the combined proof** into the SumFold portion (first `num_sumfold_rounds` rounds) and the HyperPianist portion (remaining rounds).
-4. **Verify HyperPianist SumCheck** by calling `SumCheck::verify(v, hp_proof, hp_aux_info, transcript)`, where `v` is the folded sum from SumFold.
+2. **Extract the SumFold proof** from the combined proof (first `num_sumfold_rounds` rounds).
+3. **Call `verify_sum_fold_with_transcript`** on the shared transcript. This appends `q_aux_info`, squeezes \(\rho\), and verifies each SumCheck round. Returns the subclaim \((r_b, c)\) and \(\rho\).
+4. **Check the consistency relation**:
 
-This produces a **subclaim** (r, c): "the folded polynomial at point r should equal c".
+$$c = v \cdot \text{eq}(\rho, r_b)$$
+
+where \(v\) is the claimed folded sum. This ensures the SumFold aggregation is sound.
+
+**Step 1b — HyperPianist SumCheck** (continues on the same transcript)
+
+5. **Extract the HyperPianist proof** (remaining rounds after `num_sumfold_rounds`).
+6. **Call `SumCheck::verify(v, hp_proof, hp_aux_info, transcript)`** on the same transcript whose state was advanced by Step 1a.
+
+This produces a **subclaim** \((r, c)\): "the folded polynomial at point \(r\) should equal \(c\)".
 
 ### Step 2: Evaluate the Folded Polynomial at the Challenge Point
 
@@ -156,19 +164,19 @@ $$P(\mathbf{x}) = \sum_p \text{coeff}_p \cdot \prod_{j \in \text{prod}_p} \left[
 
 This is a **"product of sums"** structure — each MLE is first folded across all M circuits with eq weights, then the gate function computes products of the folded values.
 
-The verifier computes P(r_phase1) directly from circuit data:
+The verifier computes \(P(r_{\text{phase1}})\) directly from circuit data:
 
 1. **Extract challenge coordinates**:
-   - r_b = first `num_sumfold_rounds` components of the proof point (SumFold random coordinates).
-   - r_phase1 = first `num_vars` components of the subclaim point (original polynomial variables).
+   - \(r_b\) = first `num_sumfold_rounds` components of the proof point (SumFold random coordinates).
+   - \(r_{\text{phase1}}\) = first `num_vars` components of the subclaim point (original polynomial variables).
 
-2. **Compute eq weights**: eq_rb_vec\[i\] = eq(r_b, i) for i ∈ \[0, M), using `build_eq_x_r_vec`.
+2. **Compute eq weights**: \(\text{eq\_rb\_vec}[i] = \text{eq}(r_b, i)\) for \(i \in [0, M)\), using `build_eq_x_r_vec`.
 
 3. **Fold selector and witness evaluations** across all M circuits:
-   - For each circuit i and each selector j: `folded_sel_evals[j] += eq(r_b, i) · sel_j^(i)(r_phase1)`
-   - For each circuit i and each witness j: `folded_wit_evals[j] += eq(r_b, i) · wit_j^(i)(r_phase1)`
+   - For each circuit \(i\) and each selector \(j\): \(\text{folded\_sel\_evals}[j] \mathrel{+}= \text{eq}(r_b, i) \cdot \text{sel}_j^{(i)}(r_{\text{phase1}})\)
+   - For each circuit \(i\) and each witness \(j\): \(\text{folded\_wit\_evals}[j] \mathrel{+}= \text{eq}(r_b, i) \cdot \text{wit}_j^{(i)}(r_{\text{phase1}})\)
 
-4. **Apply the gate function**: `folded_eval = eval_f(gate_func, folded_sel_evals, folded_wit_evals)`.
+4. **Apply the gate function**: \(\text{folded\_eval} = \text{eval\_f}(\text{gate\_func}, \text{folded\_sel\_evals}, \text{folded\_wit\_evals})\).
 
 ### Step 3: Compare Subclaim Against Folded Evaluation
 
@@ -182,11 +190,12 @@ If they match, the proof is consistent with the circuit data. If not, verificati
 
 ### Summary
 
-| Step   | Action                                                   | Purpose                                            |
-| ------ | -------------------------------------------------------- | -------------------------------------------------- |
-| Step 1 | Replay SumFold transcript → verify HyperPianist SumCheck | Reduce "sum equation" to "single-point evaluation" |
-| Step 2 | Compute folded polynomial value from raw circuit data    | Obtain ground truth                                |
-| Step 3 | Assert subclaim == ground truth                          | Soundness check                                    |
+| Step    | Action                                                         | Purpose                                            |
+| ------- | -------------------------------------------------------------- | -------------------------------------------------- |
+| Step 1a | Verify SumFold SumCheck + consistency check \(c = v \cdot \text{eq}(\rho, r_b)\) on shared transcript | Ensure SumFold aggregation is sound                |
+| Step 1b | Verify HyperPianist SumCheck on same transcript                | Reduce "sum equation" to "single-point evaluation" |
+| Step 2  | Compute folded polynomial value from raw circuit data          | Obtain ground truth                                |
+| Step 3  | Assert subclaim == ground truth                                | Soundness check                                    |
 
 ## Feature Flags
 
