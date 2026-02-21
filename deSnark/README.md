@@ -204,6 +204,79 @@ If they match, the proof is consistent with the circuit data. If not, verificati
 | `parallel`    | Rayon parallelism (default on) |
 | `print-trace` | Timing traces via `ark-std`    |
 
+## Speedup Benchmark
+
+Compares single-node proving (2 Rayon threads) against distributed proving (4 nodes × 2 threads each), reporting per-phase (SumFold, SumCheck) and total timings with speedup ratios.
+
+### Quick Start
+
+```bash
+# Build & run with default 5 iterations
+./scripts/bench_speedup.sh
+
+# Run with 10 iterations
+./scripts/bench_speedup.sh 10
+
+# Use a different config
+DESNARK_CONFIG=deSnark/examples/demo_config.prod.toml ./scripts/bench_speedup.sh
+```
+
+The script automatically:
+1. Builds `speedup_bench` in release mode (no debug assertions)
+2. Runs single-node benchmark (`RAYON_NUM_THREADS=2`)
+3. Launches 4 distributed nodes (workers first, then master)
+4. Prints a summary table with per-phase speedup
+
+Example output:
+
+```
+               Single (us)  Dist (us)      Speedup
+  ─────────  ──────────── ──────────── ────────────
+  SumFold         123456       45678       2.70x
+  SumCheck        234567       67890       3.45x
+  ─────────  ──────────── ──────────── ────────────
+  Total           358023      113568       3.15x
+```
+
+### Manual Execution
+
+```bash
+# Build
+cargo build --example speedup_bench -p deSnark --release
+
+# Single-node
+RAYON_NUM_THREADS=2 ./target/release/examples/speedup_bench \
+    --mode single --iters 5 deSnark/examples/demo_config.toml
+
+# Distributed (start workers first, then master)
+for i in 1 2 3; do
+    RAYON_NUM_THREADS=2 ./target/release/examples/speedup_bench \
+        --mode dist --party $i --iters 5 deSnark/examples/demo_config.toml &
+done
+sleep 2
+RAYON_NUM_THREADS=2 ./target/release/examples/speedup_bench \
+    --mode dist --party 0 --iters 5 deSnark/examples/demo_config.toml
+```
+
+### CLI Options
+
+| Option          | Default | Description                                 |
+| --------------- | ------- | ------------------------------------------- |
+| `--mode <MODE>` | —       | `single` (one node) or `dist` (distributed) |
+| `--party <ID>`  | —       | Party ID (required for `dist` mode)         |
+| `--iters <N>`   | `5`     | Number of benchmark iterations              |
+| `<config.toml>` | —       | Path to TOML config file (positional)       |
+
+### Environment Variables
+
+| Variable           | Default | Description                                    |
+| ------------------ | ------- | ---------------------------------------------- |
+| `RAYON_NUM_THREADS` | all CPUs | Number of Rayon threads per process           |
+| `RUST_LOG`         | `warn`  | Log level (set to `info` or `debug` for detail) |
+| `DESNARK_CONFIG`   | `deSnark/examples/demo_config.toml` | Config override (script only) |
+
+Logs are saved to `target/bench_speedup_logs/`.
+
 ## Tests
 
 ```bash
