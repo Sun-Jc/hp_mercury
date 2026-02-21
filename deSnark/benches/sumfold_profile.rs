@@ -142,7 +142,8 @@ fn bench_sumfold_e2e() {
                  t, length, new_nv, new_nv);
         print_sep();
 
-        let dur = bench_median(
+        // sum_fold_v3
+        let dur_v3 = bench_median(
             || {
                 let ps: Vec<_> = polys.iter().map(|p| p.deep_copy()).collect();
                 let ss = sums.clone();
@@ -155,28 +156,23 @@ fn bench_sumfold_e2e() {
             *iters,
         );
 
-        print_row("sum_fold_v3 total", dur);
-        results.push((*label, dur));
+        print_row("sum_fold_v3 total", dur_v3);
+        results.push((*label, dur_v3));
         print_footer();
     }
 
     // Summary
     print_header("Speedup Summary (compute only, no network)");
-    let a = results[0].1.as_secs_f64();
-    let b = results[1].1.as_secs_f64();
-    let c = results[2].1.as_secs_f64();
+    let a_v3 = results[0].1.as_secs_f64();
+    let b_v3 = results[1].1.as_secs_f64();
+    let c_v3 = results[2].1.as_secs_f64();
 
-    println!("║  A (single):    {:>10.3?}                                ║", results[0].1);
-    println!("║  B (curr dist): {:>10.3?}  compute speedup A/B = {:.2}x    ║", results[1].1, a / b);
-    println!("║  C (partition): {:>10.3?}  compute speedup A/C = {:.2}x    ║", results[2].1, a / c);
+    println!("║  A (single):    v3={:>10.3?}    ║", results[0].1);
+    println!("║  B (curr dist): v3={:>10.3?}    ║", results[1].1);
+    println!("║  C (partition): v3={:>10.3?}    ║", results[2].1);
     print_sep();
-    println!("║  Measured distributed speedup: 1.71x                         ║");
-    println!("║  Pure compute speedup A/B:     {:.2}x (should be ~4x)        ║", a / b);
-    println!("║  Network + contention tax:     {:.0}%                          ║",
-             (1.0 - 1.71 / (a / b)) * 100.0);
-    println!("║                                                              ║");
-    println!("║  If partitioned (C): compute speedup A/C = {:.2}x             ║", a / c);
-    println!("║  Partition gain over current: B/C = {:.2}x                    ║", b / c);
+    println!("║  v3 compute speedup A/B = {:.2}x                            ║", a_v3 / b_v3);
+    println!("║  v3 compute speedup A/C = {:.2}x                            ║", a_v3 / c_v3);
     print_footer();
 }
 

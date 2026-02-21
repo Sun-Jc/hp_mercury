@@ -10,7 +10,7 @@ use crate::errors::DeSnarkError;
 use crate::structs::{SumCheckInstance, SumFoldProof};
 use arithmetic::eq_poly::EqPolynomial;
 use arithmetic::{
-    build_eq_x_r, fix_variables, unipoly::interpolate_uni_poly, VPAuxInfo, VirtualPolynomial,
+    build_eq_x_r, fix_variables_in_place, unipoly::interpolate_uni_poly, VPAuxInfo, VirtualPolynomial,
 };
 use ark_ff::PrimeField;
 use ark_poly::{DenseMultilinearExtension, MultilinearExtension};
@@ -20,15 +20,13 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use subroutines::poly_iop::prelude::IOPProverMessage;
-use subroutines::poly_iop::sum_check::{
-    stage2_compute_sum_t, stage3_merge_split_mles, stage4_compose_poly,
-};
+use subroutines::poly_iop::sum_check::stage2_compute_sum_t;
 use subroutines::{barycentric_weights, extrapolate, IOPProof};
 use transcript::IOPTranscript;
 use tracing::{debug, info, instrument};
 
 #[cfg(feature = "parallel")]
-use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator};
+use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator};
 
 /// Result type for d_sumfold operations.
 pub type Result<T> = std::result::Result<T, DeSnarkError>;
@@ -110,14 +108,9 @@ pub fn d_sumfold<F: PrimeField, N: DeSerNet>(
     let eq_xr_vec = eq_xr_poly.to_evaluations();
 
     // ═══════════════════════════════════════════════════════════════
-    // Stage 2: Split VPs and compute partial sum_t
+    // Stage 2: Compute partial sum_t
     // Each party computes from its own M instances only.
     // ═══════════════════════════════════════════════════════════════
-    let all_splits: Vec<Vec<VirtualPolynomial<F>>> = polys
-        .iter()
-        .map(|vp| vp.split_by_last_variables(length))
-        .collect();
-
     let partial_sum_t = stage2_compute_sum_t(&sums, &eq_xr_vec);
     debug!(
         "[d_sumfold][Party {}] partial_sum_t = {:?}",
@@ -126,23 +119,28 @@ pub fn d_sumfold<F: PrimeField, N: DeSerNet>(
     );
 
     // ═══════════════════════════════════════════════════════════════
-    // Stage 3: Merge split MLEs (local — each party's own data)
+    // Stage 3+4: Build interleaved compose MLEs directly
+    //
+    // compose_mle[j][x * m + i] = polys[i].mle[j][x]
+    // Avoids split_by_last_variables + merge + compose overhead.
     // ═══════════════════════════════════════════════════════════════
-    let new_num_vars = length + num_vars;
-    let merged_mles = stage3_merge_split_mles(&all_splits, m, t, new_num_vars);
+    let compose_nv = length + num_vars;
+    let max_degree = polys[0].aux_info.max_degree + 1;
+    let products_list = polys[0].products.clone();
 
-    // ═══════════════════════════════════════════════════════════════
-    // Stage 4: Build composed VirtualPolynomial (local)
-    // ═══════════════════════════════════════════════════════════════
-    let compose_poly = stage4_compose_poly(
-        merged_mles,
-        polys[0].products.clone(),
-        polys[0].aux_info.max_degree + 1,
-        new_num_vars,
-    );
+    let mut compose_mle_evals: Vec<Vec<F>> = Vec::with_capacity(t);
+    for j in 0..t {
+        let mut f = Vec::with_capacity(m << num_vars);
+        for x in 0..(1 << num_vars) {
+            for i in 0..m {
+                f.push(polys[i].flattened_ml_extensions[j].evaluations[x]);
+            }
+        }
+        compose_mle_evals.push(f);
+    }
 
     // Precompute barycentric weights for extrapolation
-    let extrapolation_aux: Vec<(Vec<F>, Vec<F>)> = (1..compose_poly.aux_info.max_degree)
+    let extrapolation_aux: Vec<(Vec<F>, Vec<F>)> = (1..max_degree)
         .map(|degree| {
             let points = (0..1 + degree as u64).map(F::from).collect::<Vec<_>>();
             let weights = barycentric_weights(&points);
@@ -167,18 +165,10 @@ pub fn d_sumfold<F: PrimeField, N: DeSerNet>(
         Vec::new()
     };
     let mut challenges: Vec<F> = Vec::with_capacity(length);
-    let mut eq_fix = eq_xr_poly.as_ref().clone();
-
-    let mut flattened_ml_extensions: Vec<DenseMultilinearExtension<F>> = compose_poly
-        .flattened_ml_extensions
-        .iter()
-        .map(|x| x.as_ref().clone())
-        .collect();
-
-    let products_list = compose_poly.products.clone();
+    let mut eq_fix_evals = eq_xr_poly.to_evaluations();
 
     for round in 0..length {
-        // Apply previous challenge (fix_variables)
+        // Apply previous challenge (parallel fix_variables on raw Vec)
         if let Some(chal) = challenge {
             if round == 0 {
                 return Err(DeSnarkError::HyperPlonkError(
@@ -188,15 +178,18 @@ pub fn d_sumfold<F: PrimeField, N: DeSerNet>(
             challenges.push(chal);
 
             let r = challenges[round - 1];
-            #[cfg(feature = "parallel")]
-            flattened_ml_extensions
-                .par_iter_mut()
-                .for_each(|mle| *mle = fix_variables(mle, &[r]));
-            #[cfg(not(feature = "parallel"))]
-            flattened_ml_extensions
-                .iter_mut()
-                .for_each(|mle| *mle = fix_variables(mle, &[r]));
-            eq_fix = fix_variables(&eq_fix, &[r]);
+            let nv = compose_nv - (round - 1);
+            let half_len = 1 << (nv - 1);
+            for j in 0..t {
+                let src = &compose_mle_evals[j];
+                let mut dst = vec![F::zero(); half_len];
+                dst.par_iter_mut().enumerate().for_each(|(i, x)| {
+                    *x = src[i << 1] + (src[(i << 1) + 1] - src[i << 1]) * r;
+                });
+                compose_mle_evals[j] = dst;
+            }
+            let eq_nv = length - (round - 1);
+            fix_variables_in_place(&mut eq_fix_evals, eq_nv, &[r]);
         } else if round > 0 {
             return Err(DeSnarkError::HyperPlonkError(
                 "verifier message is empty".into(),
@@ -204,15 +197,15 @@ pub fn d_sumfold<F: PrimeField, N: DeSerNet>(
         }
 
         // Compute partial products_sum (from this party's data only)
-        let mut products_sum = vec![F::zero(); compose_poly.aux_info.max_degree + 1];
+        let mut products_sum = vec![F::zero(); max_degree + 1];
+        let current_nv = compose_nv - round;
 
         // Compute eq_sum for this round
-        let half = 1 << (length - round - 1);
-        let mut eq_sum = vec![vec![F::zero(); half]; compose_poly.aux_info.max_degree + 1];
-        for b in 0..half {
-            let table = &eq_fix;
-            let mut eval = table[b << 1];
-            let step = table[(b << 1) + 1] - table[b << 1];
+        let eq_bucket_count = 1 << (length - round - 1);
+        let mut eq_sum = vec![vec![F::zero(); eq_bucket_count]; max_degree + 1];
+        for b in 0..eq_bucket_count {
+            let mut eval = eq_fix_evals[b << 1];
+            let step = eq_fix_evals[(b << 1) + 1] - eval;
 
             eq_sum[0][b] = eval;
 
@@ -223,8 +216,8 @@ pub fn d_sumfold<F: PrimeField, N: DeSerNet>(
         }
 
         products_list.iter().for_each(|(coefficient, products)| {
-            let bucket_count = 1 << (length - round - 1);
-            let mut sum = cfg_into_iter!(0..1 << (compose_poly.aux_info.num_variables - round - 1))
+            let bucket_count = eq_bucket_count;
+            let mut sum = cfg_into_iter!(0..1 << (current_nv - 1))
                 .fold(
                     || {
                         (
@@ -236,7 +229,7 @@ pub fn d_sumfold<F: PrimeField, N: DeSerNet>(
                         buf.iter_mut()
                             .zip(products.iter())
                             .for_each(|((eval, step), f)| {
-                                let table = &flattened_ml_extensions[*f];
+                                let table = &compose_mle_evals[*f];
                                 *eval = table[b << 1];
                                 *step = table[(b << 1) + 1] - table[b << 1];
                             });
@@ -278,7 +271,7 @@ pub fn d_sumfold<F: PrimeField, N: DeSerNet>(
             sum.iter_mut().for_each(|sum| *sum *= coefficient);
 
             let extrapolation =
-                cfg_into_iter!(0..compose_poly.aux_info.max_degree - products.len() - 1)
+                cfg_into_iter!(0..max_degree - products.len() - 1)
                     .map(|i| {
                         let (points, weights) = &extrapolation_aux[products.len()];
                         let at = F::from((products.len() + 2 + i) as u64);
@@ -402,25 +395,21 @@ pub fn d_sumfold<F: PrimeField, N: DeSerNet>(
         partial_v
     );
 
-    // Build folded polynomial from this party's data
-    #[cfg(feature = "parallel")]
-    flattened_ml_extensions
-        .par_iter_mut()
-        .for_each(|mle| *mle = fix_variables(mle, &[final_challenge_val]));
-    #[cfg(not(feature = "parallel"))]
-    flattened_ml_extensions
-        .iter_mut()
-        .for_each(|mle| *mle = fix_variables(mle, &[final_challenge_val]));
-
-    #[cfg(feature = "parallel")]
-    let new_mle: Vec<Arc<DenseMultilinearExtension<F>>> = flattened_ml_extensions
-        .par_iter()
-        .map(|mle| Arc::new(mle.clone()))
-        .collect();
-    #[cfg(not(feature = "parallel"))]
-    let new_mle: Vec<Arc<DenseMultilinearExtension<F>>> = flattened_ml_extensions
+    // Build folded polynomial from this party's data (parallel fix on raw Vec)
+    let final_nv = compose_nv - (length - 1);
+    let final_half = 1 << (final_nv - 1);
+    let new_mle: Vec<Arc<DenseMultilinearExtension<F>>> = compose_mle_evals
         .iter()
-        .map(|mle| Arc::new(mle.clone()))
+        .map(|src| {
+            let mut dst = vec![F::zero(); final_half];
+            dst.par_iter_mut().enumerate().for_each(|(i, x)| {
+                *x = src[i << 1] + (src[(i << 1) + 1] - src[i << 1]) * final_challenge_val;
+            });
+            Arc::new(DenseMultilinearExtension::from_evaluations_vec(
+                final_nv - 1,
+                dst,
+            ))
+        })
         .collect();
 
     let mut hm = HashMap::new();
